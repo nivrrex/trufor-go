@@ -1,0 +1,11 @@
+# 上游参考实现与官方权重（不入库）
+/upstream/
+/ref/
+/ref_weights/
+# 二进制与临时产物
+/bin/
+*.pth.tar
+*.zip
+__pycache__/
+*.pyc
+/trufor

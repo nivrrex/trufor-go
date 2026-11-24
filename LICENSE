@@ -1,0 +1,37 @@
+TruFor-go is a Go reimplementation of TruFor, which is intellectual property of the
+Image Processing Research Group of University Federico II of Naples ('GRIP-UNINA').
+
+The upstream TruFor software (https://github.com/grip-unina/TruFor) is distributed
+under the following terms, which this reimplementation carries over:
+
+    Reproduction, modification, and usage of the software covered by this license
+    is allowed free of charge provided that:
+    (i) this software should be used, reproduced and modified only for informational
+        and nonprofit purposes; any unauthorized use of this software for industrial
+        or profit-oriented activities is expressly prohibited; and
+    (ii) any reproduction or modification retains all original notices including
+         proprietary or copyright notices; and
+    (iii) reference to the original authors is given whenever results, which arise
+          from the use of this software or any modification of it, are made public.
+
+    This software is provided 'as-is', without any express or implied warranty.
+    In no event will the authors be held liable for any damages arising from the use
+    of this software.
+
+Model weights are NOT distributed with this repository. They are available from the
+original authors at https://www.grip.unina.it/download/prog/TruFor/TruFor_weights.zip
+and are subject to the same terms.
+
+If you publish results obtained with this software, please cite:
+
+    @InProceedings{Guillaro_2023_CVPR,
+      author    = {Guillaro, Fabrizio and Cozzolino, Davide and Sud, Avneesh and
+                   Dufour, Nicholas and Verdoliva, Luisa},
+      title     = {TruFor: Leveraging All-Round Clues for Trustworthy Image Forgery
+                   Detection and Localization},
+      booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and
+                   Pattern Recognition (CVPR)},
+      month     = {June},
+      year      = {2023},
+      pages     = {20606-20615}
+    }
