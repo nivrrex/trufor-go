@@ -38,6 +38,7 @@ func main() {
 		threads = flag.Int("threads", runtime.NumCPU(), "算子并行度（本实现扩展参数）")
 		wp      = flag.String("weights", defaultWeights(), "权重文件 trufor.pth.tar（本实现扩展参数）")
 		cpuProf = flag.String("cpuprofile", "", "把 CPU profile 写入该文件（本实现扩展参数）")
+		memProf = flag.String("memprofile", "", "推理结束后把堆 profile 写入该文件（本实现扩展参数）")
 		force   = flag.Bool("force", false, "覆盖已存在的输出文件（上游默认跳过）")
 	)
 	flag.Usage = func() {
@@ -80,11 +81,28 @@ func main() {
 	}
 
 	// 推理以大块张量为主，默认 GOGC 会让堆膨胀到活跃数据的 2 倍以上；收紧以降低峰值内存。
-	debug.SetGCPercent(50)
+	// 显式设置 GOGC 环境变量时以环境为准（便于按机器内存调参），否则用保守默认 50。
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(50)
+	}
 
 	if err := run(*input, *output, *wp, *threads, *saveNP, *force); err != nil {
 		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *memProf != "" {
+		f, err := os.Create(*memProf)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+		runtime.GC() // 先回收，heap profile 反映存活对象（分配热点另见 alloc_space）
+		if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
