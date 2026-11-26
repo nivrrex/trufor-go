@@ -1,4 +1,5 @@
 // Package trufor 是 TruFor（图像篡改检测与定位）的 Go 推理实现对外接口。
+// 默认使用纯 Go CPU 实现；trufor_ort 构建可使用 ONNX Runtime CPU 后端。
 //
 // 与上游 PyTorch 参考实现（github.com/grip-unina/TruFor）的输出保持一致：
 // 给定一张 RGB 图像，返回定位图 map、置信图 conf、整图分数 score 与 Noiseprint++。
@@ -17,7 +18,9 @@ import (
 	"fmt"
 	"image"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/nivrrex/trufor-go/internal/imageio"
 	"github.com/nivrrex/trufor-go/internal/model/trufor"
@@ -39,7 +42,7 @@ type Result struct {
 	Map []float32
 	// Conf 是置信图（sigmoid 后的 TCP 置信度，0~1）。
 	Conf []float32
-	// Noiseprint 是 Noiseprint++（未归一化的噪声残差指纹）。
+	// Noiseprint 是 Noiseprint++（未归一化的噪声残差指纹）。ONNX 后端不输出该张量，此时为 nil。
 	Noiseprint []float32
 	// Score 是整图完整性分数（0~1，越大越可能被篡改）。
 	Score float32
@@ -50,6 +53,7 @@ type Result struct {
 // Model 是已加载的模型。可并发调用 Detect* 方法。
 type Model struct {
 	inner   *trufor.Model
+	onnx    *onnxBackend
 	workers int
 }
 
@@ -57,6 +61,9 @@ type Model struct {
 func Load(cfg Config) (*Model, error) {
 	if cfg.Weights == "" {
 		return nil, fmt.Errorf("trufor: 未指定权重文件")
+	}
+	if strings.EqualFold(filepath.Ext(cfg.Weights), ".onnx") {
+		return LoadONNX(cfg)
 	}
 	if _, err := os.Stat(cfg.Weights); err != nil {
 		return nil, fmt.Errorf("trufor: 权重文件不可用: %w", err)
@@ -74,6 +81,25 @@ func Load(cfg Config) (*Model, error) {
 		return nil, fmt.Errorf("trufor: 构造模型: %w", err)
 	}
 	return &Model{inner: inner, workers: workers}, nil
+}
+
+// LoadONNX 加载 TruFor ONNX 模型。需要 trufor_ort 构建标签与可动态加载的 ONNX Runtime。
+func LoadONNX(cfg Config) (*Model, error) {
+	if cfg.Weights == "" || !strings.EqualFold(filepath.Ext(cfg.Weights), ".onnx") {
+		return nil, fmt.Errorf("trufor: ONNX 权重路径必须以 .onnx 结尾")
+	}
+	if _, err := os.Stat(cfg.Weights); err != nil {
+		return nil, fmt.Errorf("trufor: ONNX 权重文件不可用: %w", err)
+	}
+	workers := cfg.Threads
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	backend, err := newONNXBackend(cfg.Weights, workers)
+	if err != nil {
+		return nil, fmt.Errorf("trufor: 加载 ONNX 后端: %w", err)
+	}
+	return &Model{onnx: backend, workers: workers}, nil
 }
 
 // Threads 返回加载时确定的并行度。
@@ -101,7 +127,13 @@ func (m *Model) DetectFile(path string) (*Result, error) {
 }
 
 func (m *Model) detect(x *tensor.Tensor) (*Result, error) {
-	if m == nil || m.inner == nil {
+	if m == nil {
+		return nil, fmt.Errorf("trufor: 模型未加载")
+	}
+	if m.onnx != nil {
+		return m.onnx.detect(x)
+	}
+	if m.inner == nil {
 		return nil, fmt.Errorf("trufor: 模型未加载")
 	}
 	r, err := m.inner.Forward(x)
@@ -118,5 +150,13 @@ func (m *Model) detect(x *tensor.Tensor) (*Result, error) {
 	}, nil
 }
 
-// Close 释放模型持有的资源（当前实现无需显式释放，保留以兼容未来版本）。
-func (m *Model) Close() error { return nil }
+// Close 释放模型持有的资源。纯 Go 实现无需显式释放；ONNX 后端会等待进行中的推理结束。
+func (m *Model) Close() error {
+	if m == nil {
+		return nil
+	}
+	if m.onnx != nil {
+		return m.onnx.close()
+	}
+	return nil
+}

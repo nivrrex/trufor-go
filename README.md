@@ -12,6 +12,9 @@ TruFor 的 **Go 语言 CPU 推理实现**：[TruFor](https://github.com/grip-uni
 纯 Go 实现，不依赖 PyTorch/CGO，直接读取官方 `.pth.tar` 权重；amd64 上带有手写 AVX2+FMA
 内核，其它平台自动回退到纯 Go（结果相同，速度较慢）。
 
+可选 `trufor_ort` 构建通过 CGO 动态加载 ONNX Runtime，直接读取 `trufor.onnx`，
+用于与 Python ONNX Runtime 链路保持一致的速度；默认构建不受影响。
+
 > 上游 TruFor 为 GRIP-UNINA 的非营利/信息用途授权软件，本实现沿用同一授权，
 > 详见 [LICENSE](LICENSE)。引用/发表结果时请引用原论文（见文末）。
 
@@ -65,7 +68,8 @@ trufor -gpu -1 -in <文件|目录|通配符> -out <目录|文件名> [-save_np]
   已存在的输出文件**默认跳过**，加 `-force` 覆盖
 - `-save_np`：额外输出 `np++`
 - `-gpu`：仅为与上游参数对齐而保留，本实现只接受 `-1`（CPU）
-- 扩展参数：`-threads N`（并行度，默认 CPU 核数）、`-weights PATH`、`-cpuprofile FILE`
+- 扩展参数：`-threads N`（并行度，默认 CPU 核数）、`-weights PATH`、`-cpuprofile FILE`、
+  `-memprofile FILE`
 
 ```bash
 # 单张：输出为 <out>/<输入文件名>.npz
@@ -137,18 +141,40 @@ func main() {
 `*trufor.Model` 可并发调用 `DetectFile` / `DetectImage`。`DetectImage` 接受任意
 `image.Image`（例如来自 `image.Decode` 或调用方自己的解码器）。
 
+## 可选 ONNX Runtime CPU 后端（linux/amd64）
+
+当 `-weights`/`Config.Weights` 以 `.onnx` 结尾时自动选择 ORT 后端。需要 CGO 与本机
+ONNX Runtime 1.29（C API 头文件按上游 v1.29.0 固定，见 `internal/ort/include/SOURCE.md`）：
+
+```bash
+CGO_ENABLED=1 go build -tags trufor_ort -o trufor_ort ./cmd/trufor
+TRUFOR_ORT_LIBRARY=/path/to/libonnxruntime.so.1 \
+  ./trufor_ort -gpu -1 -in image.png -out out -weights /path/to/trufor.onnx
+```
+
+- 库查找顺序：`TRUFOR_ORT_LIBRARY` → `libonnxruntime.so.1` → `libonnxruntime.so`。
+- ORT 使用固定输入/输出名 `rgb/out/conf/det`；`intra-op` 线程数由 `-threads` 控制，
+  `inter-op=1`，图优化等级与 Python 版一致（`ORT_ENABLE_ALL`）。
+- ONNX 模型不输出 Noiseprint++，因此 `Result.Noiseprint` 为 nil；map/conf/score 正常返回。
+- 未启用标签、非 linux/amd64 或库不可用时返回明确错误；普通 `CGO_ENABLED=0` 构建仍是
+  完全静态的纯 Go 版本。Windows 的 ORT DLL 加载尚未实现。
+
 ## 性能
 
-在 Intel i5-7600（4 核，AVX2）上，单进程 4 线程，含读图与写盘：
+2026-11-25 同机实测（Ryzen 5 2600 6C12T、31GB；1200×900 与 1536×2048 PNG；
+模型加载不计入，Python/Go 均使用 CPU）：
 
-| 输入尺寸 | 本实现 | PyTorch CPU（同机参考） |
-|---|---|---|
-| 256×256 | 1.5 s | 1.0 s |
-| 1024×768 | 16 s | 10.5 s |
-| 2048×1536 | 110 s（峰值内存 4.7 GB） | 66 s |
+| 输入 | 纯 Go（本轮优化后） | Go + ORT | Python ONNX Runtime |
+|---|---:|---:|---:|
+| 1200×900 | 约 23.0 s | 15.0–16.4 s | 16.0–17.1 s |
+| 1536×2048 | 约 80 s | 约 50.1 s | 约 52.8 s |
 
-Noiseprint++ 单项快于 PyTorch CPU（512²：1.33 s vs 1.40 s）。大图会自动对 Noiseprint++
-做空间分块以控制内存。其它平台回退纯 Go，速度约慢 10~20 倍。
+ORT 与 Python 的 map/conf 最大绝对差分别约 `1.73e-6` / `5.36e-7`，score 差约 `1.95e-7`。
+原生 3000×4000 输入下，纯 Go 约 540 s、峰值约 15.5GB；Python ORT 申请约 34.9GB
+缓冲并失败，因此该尺寸不做速度一致性声明。大图应显式设置 `--trufor-max-size`。
+
+历史 i5-7600 数据（上一版实现，仅作存档）：256×256 Go 1.5s/Python 1.0s；
+1024×768 Go 16s/Python 10.5s；2048×1536 Go 110s/Python 66s。
 
 ## 精度
 
