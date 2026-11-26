@@ -102,6 +102,11 @@ func LoadONNX(cfg Config) (*Model, error) {
 	return &Model{onnx: backend, workers: workers}, nil
 }
 
+// NoiseprintSupported 报告当前后端是否输出 Noiseprint++。ONNX 后端返回 false。
+func (m *Model) NoiseprintSupported() bool {
+	return m != nil && m.onnx == nil && m.inner != nil
+}
+
 // Threads 返回加载时确定的并行度。
 func (m *Model) Threads() int { return m.workers }
 

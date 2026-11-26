@@ -139,6 +139,9 @@ func TestDirectVsGather(t *testing.T) {
 			}
 		}
 		t.Logf("m=%d n=%d k=%d: 逐位不一致 %d/%d，最大差 %.3e", tc.m, tc.n, tc.k, bad, len(c1), maxDiff)
+		if bad != 0 {
+			t.Fatalf("m=%d n=%d k=%d: Direct/Gather 逐位不一致 %d 个元素", tc.m, tc.n, tc.k, bad)
+		}
 	}
 }
 

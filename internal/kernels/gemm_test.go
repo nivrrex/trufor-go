@@ -65,6 +65,40 @@ func TestSgemmMatchesReference(t *testing.T) {
 	}
 }
 
+func TestPrepackedStrideFallback(t *testing.T) {
+	rng := rand.New(rand.NewSource(77))
+	const m, n, k, lda = 7, 17, 5, 11
+	a := make([]float32, m*lda)
+	b := make([]float32, k*n)
+	for i := range a {
+		a[i] = float32(rng.NormFloat64())
+	}
+	for i := range b {
+		b[i] = float32(rng.NormFloat64())
+	}
+	ap, tiles, tail := PackA(a, m, k, lda)
+	want := naiveRef(a, m, k, lda, b, n, n)
+	fill := func(k0, kk, jt, cols int, dst []float32) {
+		for p := 0; p < kk; p++ {
+			copy(dst[p*cols:(p+1)*cols], b[(k0+p)*n+jt:(k0+p)*n+jt+cols])
+		}
+	}
+	for _, gather := range []bool{false, true} {
+		got := make([]float32, m*n)
+		if gather {
+			SgemmGatherPrepackedStride(ap, a, m, tiles, tail, n, k, lda, fill, got, n, 1)
+		} else {
+			SgemmPrepackedStride(ap, a, m, tiles, tail, n, k, lda, b, n, got, n, 1)
+		}
+		for i := range got {
+			d := math.Abs(float64(got[i]) - want[i])
+			if d > 1e-4 {
+				t.Fatalf("gather=%v 元素 %d: got %v, want %v", gather, i, got[i], want[i])
+			}
+		}
+	}
+}
+
 // TestSgemmWorkersDeterministic 校验并行度不影响结果（累加顺序固定）。
 func TestSgemmWorkersDeterministic(t *testing.T) {
 	rng := rand.New(rand.NewSource(6))

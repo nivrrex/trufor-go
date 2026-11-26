@@ -156,25 +156,23 @@ TRUFOR_ORT_LIBRARY=/path/to/libonnxruntime.so.1 \
 - ORT 使用固定输入/输出名 `rgb/out/conf/det`；`intra-op` 线程数由 `-threads` 控制，
   `inter-op=1`，图优化等级与 Python 版一致（`ORT_ENABLE_ALL`）。
 - ONNX 模型不输出 Noiseprint++，因此 `Result.Noiseprint` 为 nil；map/conf/score 正常返回。
+  CLI 在 ONNX 后端遇到 `-save_np` 会明确报错，避免写出空数组。
 - 未启用标签、非 linux/amd64 或库不可用时返回明确错误；普通 `CGO_ENABLED=0` 构建仍是
   完全静态的纯 Go 版本。Windows 的 ORT DLL 加载尚未实现。
 
 ## 性能
 
-2026-11-25 同机实测（Ryzen 5 2600 6C12T、31GB；1200×900 与 1536×2048 PNG；
-模型加载不计入，Python/Go 均使用 CPU）：
+2026-11-26 同机实测（AMD Ryzen 5 2600 6C12T、31GB；固定合成输入；12 线程；
+模型加载与预热不计入采样）。复现程序与原始 JSON 见 `benchmarks/`：
 
-| 输入 | 纯 Go（本轮优化后） | Go + ORT | Python ONNX Runtime |
-|---|---:|---:|---:|
-| 1200×900 | 约 14.3 s | 约 14.1 s | 约 14.1 s |
-| 1536×2048 | 约 53–55 s | 约 46.0 s | 约 47.8 s |
+| 输入 | 纯 Go 基线 c0f1284 | 纯 Go 优化 | Go + ORT | Python ORT |
+|---|---:|---:|---:|---:|
+| 1200×900 | 33.15s | **14.33s** | **11.88s** | 12.23s |
+| 1536×2048 | 145.87s | **55.52s** | **43.30s** | 44.74s |
+| 3000×4000 | 1141.97s | **332.13s** | 未测 | 未测 |
 
-ORT 与 Python 的 map/conf 最大绝对差分别约 `1.73e-6` / `5.36e-7`，score 差约 `1.95e-7`。
-原生 3000×4000 输入下，纯 Go 约 340s、峰值约 16.8GB；Python ORT 申请约 34.9GB
-缓冲并失败，因此该尺寸不做速度一致性声明。大图应显式设置 `--trufor-max-size`。
-
-历史 i5-7600 数据（上一版实现，仅作存档）：256×256 Go 1.5s/Python 1.0s；
-1024×768 Go 16s/Python 10.5s；2048×1536 Go 110s/Python 66s。
+纯 Go 使用 `trufor.pth.tar`，ORT 使用 `trufor.onnx`；Go ORT 与 Python ORT 的 score
+最大差约 `1.1e-7`。原生 12MP 内存需求仍高，应先缩小输入或使用 seal-go 的尺寸限制功能。
 
 ## 精度
 

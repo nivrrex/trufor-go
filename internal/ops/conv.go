@@ -305,7 +305,7 @@ func (c *Conv2D) Accumulate1x1IntoPacked(dst, src *tensor.Tensor, offset int, ap
 		return fmt.Errorf("conv2d.Accumulate1x1IntoPacked: 形状或通道区间不匹配")
 	}
 	plane := src.H * src.W
-	kernels.SgemmPrepacked(ap, c.w[offset:], c.OutC, tiles, tail, plane, src.C, src.Data, plane, dst.Data, plane, workers)
+	kernels.SgemmPrepackedStride(ap, c.w[offset:], c.OutC, tiles, tail, plane, src.C, c.InC, src.Data, plane, dst.Data, plane, workers)
 	return nil
 }
 

@@ -29,8 +29,8 @@ type Head struct {
 	fuseTail [4]int
 }
 
-// decoderWorkspace 保存定位头/置信头可复用的中间缓冲。两个头串行执行，
-// ForwardPair 在一次推理内共享同一组内存，返回后由调用方释放。
+// decoderWorkspace 保存单个解码头可复用的中间缓冲。ForwardPair 串行共享一个实例；
+// ForwardPairParallel 为两个头各创建一个实例，返回后由调用方释放。
 type decoderWorkspace struct {
 	tok   []float32
 	proj  [4]*tensor.Tensor

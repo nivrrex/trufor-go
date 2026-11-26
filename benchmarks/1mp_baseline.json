@@ -1,0 +1,40 @@
+{
+  "go_version": "go1.27.4",
+  "goos": "linux",
+  "goarch": "amd64",
+  "cpu_model": "AMD Ryzen 5 2600 Six-Core Processor",
+  "num_cpu": 12,
+  "threads": 12,
+  "width": 1200,
+  "height": 900,
+  "warmup": 1,
+  "samples": [
+    {
+      "run": 1,
+      "seconds": 33.22909028,
+      "score": 0.06261822,
+      "map_checksum": 16274143089124581340,
+      "conf_checksum": 11265686454748491736,
+      "allocated_mib": 18066.952194213867,
+      "heap_mib": 1750.8909378051758
+    },
+    {
+      "run": 2,
+      "seconds": 32.941043854,
+      "score": 0.06261822,
+      "map_checksum": 16274143089124581340,
+      "conf_checksum": 11265686454748491736,
+      "allocated_mib": 18066.953063964844,
+      "heap_mib": 1189.2383346557617
+    },
+    {
+      "run": 3,
+      "seconds": 33.149110298,
+      "score": 0.06261822,
+      "map_checksum": 16274143089124581340,
+      "conf_checksum": 11265686454748491736,
+      "allocated_mib": 18066.958251953125,
+      "heap_mib": 1750.9001083374023
+    }
+  ]
+}

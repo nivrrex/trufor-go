@@ -56,28 +56,38 @@ func PackA(a []float32, m, k, lda int) (ap []float32, nTiles, tailRows int) {
 }
 
 // SgemmDirectPrepacked 与 SgemmDirect 相同，但 A 已由 PackA 预先打包（权重固定时省掉每次打包）。
+// 为兼容旧调用保留 lda=k 的包装；行跨度不同时使用 SgemmDirectPrepackedStride。
 func SgemmDirectPrepacked(ap, a []float32, m, nTiles, tailRows, n, k int, b []float32, ldb int, c []float32, ldc int, workers int) {
-	fill := func(k0, kk, jt, cols int, dst []float32) {
-		for p := 0; p < kk; p++ {
-			copy(dst[p*cols:p*cols+cols], b[(k0+p)*ldb+jt:(k0+p)*ldb+jt+cols])
-		}
-	}
-	_ = fill
-	sgemmPrepacked(ap, a, m, nTiles, tailRows, n, k, nil, b, ldb, c, ldc, workers)
+	SgemmDirectPrepackedStride(ap, a, m, nTiles, tailRows, n, k, k, b, ldb, c, ldc, workers)
 }
 
-// SgemmPrepacked 与 Sgemm 相同，但 A 已预先打包（B 仍按 64 列面板打包）。
+// SgemmDirectPrepackedStride 是 SgemmDirectPrepacked 的显式行跨度版本。
+func SgemmDirectPrepackedStride(ap, a []float32, m, nTiles, tailRows, n, k, lda int, b []float32, ldb int, c []float32, ldc int, workers int) {
+	sgemmPrepacked(ap, a, m, nTiles, tailRows, n, k, lda, nil, b, ldb, c, ldc, workers)
+}
+
+// SgemmPrepacked 与 Sgemm 相同，但 A 已预先打包（B 仍按面板打包）。
 func SgemmPrepacked(ap, a []float32, m, nTiles, tailRows, n, k int, b []float32, ldb int, c []float32, ldc int, workers int) {
-	sgemmPrepacked(ap, a, m, nTiles, tailRows, n, k, nil, b, ldb, c, ldc, workers)
+	SgemmPrepackedStride(ap, a, m, nTiles, tailRows, n, k, k, b, ldb, c, ldc, workers)
+}
+
+// SgemmPrepackedStride 是 SgemmPrepacked 的显式行跨度版本。
+func SgemmPrepackedStride(ap, a []float32, m, nTiles, tailRows, n, k, lda int, b []float32, ldb int, c []float32, ldc int, workers int) {
+	sgemmPrepacked(ap, a, m, nTiles, tailRows, n, k, lda, nil, b, ldb, c, ldc, workers)
 }
 
 // SgemmGatherPrepacked 与 SgemmGather 相同，但 A 已预先打包。
 func SgemmGatherPrepacked(ap, a []float32, m, nTiles, tailRows, n, k int, fill BPanelFiller, c []float32, ldc int, workers int) {
-	sgemmPrepacked(ap, a, m, nTiles, tailRows, n, k, fill, nil, 0, c, ldc, workers)
+	SgemmGatherPrepackedStride(ap, a, m, nTiles, tailRows, n, k, k, fill, c, ldc, workers)
+}
+
+// SgemmGatherPrepackedStride 是 SgemmGatherPrepacked 的显式行跨度版本。
+func SgemmGatherPrepackedStride(ap, a []float32, m, nTiles, tailRows, n, k, lda int, fill BPanelFiller, c []float32, ldc int, workers int) {
+	sgemmPrepacked(ap, a, m, nTiles, tailRows, n, k, lda, fill, nil, 0, c, ldc, workers)
 }
 
 // sgemmPrepacked 是预打包 A 的公共核心：fill 为 nil 时按 ldb 从 b 直接打包 B 面板。
-func sgemmPrepacked(ap, a []float32, m, nTiles, tailRows, n, k int, fill BPanelFiller, b []float32, ldb int, c []float32, ldc int, workers int) {
+func sgemmPrepacked(ap, a []float32, m, nTiles, tailRows, n, k, lda int, fill BPanelFiller, b []float32, ldb int, c []float32, ldc int, workers int) {
 	if m <= 0 || n <= 0 || k <= 0 {
 		return
 	}
@@ -94,11 +104,11 @@ func sgemmPrepacked(ap, a []float32, m, nTiles, tailRows, n, k int, fill BPanelF
 	if !simdAvailable() || (nTiles == 0 && tailRows < 2) {
 		col := make([]float32, k*n)
 		fill(0, k, 0, n, col)
-		gemmRowsGo(a, m, k, k, col, n, n, c, ldc, workers)
+		gemmRowsGo(a, m, k, lda, col, n, n, c, ldc, workers)
 		return
 	}
 	run := func(j0, j1 int) {
-		workerRange(ap, a, fill, c, m, n, k, k, ldc, j0, j1, nTiles, tailRows)
+		workerRange(ap, a, fill, c, m, n, k, lda, ldc, j0, j1, nTiles, tailRows)
 	}
 	jBlocks := (n + nc - 1) / nc
 	if jBlocks == 1 || workers == 1 {

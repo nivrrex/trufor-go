@@ -52,10 +52,12 @@
 
 ### 结果
 
-- 1MP：约 24.0s → **14.24–14.31s**，与 Python ORT 约 14.11s 基本一致。
-- 3MP：约 80s → **约 53–55s**，Python ORT 约 47.8s。
-- 12MP：约 540s → **约 339.9s**，峰值约 16.8GB。
-- 1MP/3MP score 与本轮开始时一致；6 图端到端对拍结构性差异 0。
+同机固定输入 A/B（AMD Ryzen 5 2600、12 线程、模型加载/预热排除；原始 JSON 见 `benchmarks/`）：
+
+- 1MP：`c0f1284` 33.15s → **14.33s**；Python ORT 12.23s。
+- 3MP：`c0f1284` 145.87s → **55.52s**；Python ORT 44.74s。
+- 12MP：`c0f1284` 1141.97s → **332.13s**。
+- 1MP/3MP score 与各自基线一致；6 图端到端对拍结构性差异 0。
 
 ### 第二轮回退项
 
@@ -79,8 +81,8 @@ Linear 全切 B 打包、B 面板预打包、3×32 TapPlan、Direct 3×32、注�
 
 | 输入 | Go + ORT | Python ORT | 数值差 |
 |---|---:|---:|---|
-| 1200×900 | 约 14.1s | 约 14.1s | map 1.73e-6；conf 5.36e-7；score 1.95e-7 |
-| 1536×2048 | 约 46.0s | 约 47.8s | 端到端对拍结构性差异 0 |
+| 1200×900 | 约 11.88s | 约 12.23s | score 最大差约 1.1e-7 |
+| 1536×2048 | 约 43.30s | 约 44.74s | 端到端对拍结构性差异 0 |
 
 原生 3000×4000 下 Python ORT 申请约 34.9GB 缓冲并失败；Go ORT 未在该尺寸宣称通过。
 
@@ -96,9 +98,23 @@ Linear 全切 B 打包、B 面板预打包、3×32 TapPlan、Direct 3×32、注�
 - 6×16 微内核 K 展开 2 次：约 22.2s vs 21.0s，回退。
 - CrossAttention M 并行：1MP 变慢，回退。
 
+## 审计整改（P0/P1）
+
+- 预打包 GEMM 新增显式 `lda` 版本；旧 API 保留 `lda=k` 包装，decoder 分段权重使用
+  `SgemmPrepackedStride` 传入真实行跨度。
+- SIMD 检测/声明按 `amd64` 与 `trufor_scalar` 构建标签隔离；非 amd64 提供明确 panic 的
+  编译期占位与标量辅助函数，正常路径由 `simdAvailable=false` 进入纯 Go。
+- `TestPrepackedStrideFallback` 覆盖 `lda≠k`；`trufor_scalar` 全量 golden 通过。
+- `TestDirectVsGather` 对逐位不一致执行失败；`TestDecoderParity` 对 PNG 执行 `5e-4`
+  阈值断言，JPEG 明确跳过独立 decoder 对拍并交由 E2E JPEG 容差覆盖。
+- ORT `-save_np` 明确拒绝；修正文档中不存在的参数与 decoder 工作区注释。
+- 新增 `tools/bench_inference.go`、`tools/bench_python.py` 和 `benchmarks/` 原始 JSON。
+
 ## 5. 验证
 
-- `go test -count=1 ./...`：默认纯 Go 全通过。
+- 默认 `go test -count=1 ./...`：全通过。
+- `go test -count=1 -tags trufor_scalar ./...`：强制非 AVX2 回退全通过。
+- Linux arm64 交叉编译与 vet：通过。
 - 纯 Go 并发包 `CGO_ENABLED=1 go test -race`（kernels/ops/segformer/trufor）：通过。
 - `CGO_ENABLED=1 go test -race -tags trufor_ort ./internal/ort`：通过。
 - ORT 集成测试覆盖正常输出、并发 Run 确定性、Close 后错误、缺失模型错误。
@@ -110,5 +126,5 @@ Linear 全切 B 打包、B 面板预打包、3×32 TapPlan、Direct 3×32、注�
 
 - ORT 后端仅 linux/amd64；Windows 仍使用默认纯 Go 构建。
 - ORT 库与 ONNX 权重不随仓库分发；需用户提供。
-- 原生 12MP 内存需求仍高，应显式限制 `--trufor-max-size`。
+- 原生 12MP 内存需求仍高，应先缩小输入或使用 seal-go 的尺寸限制功能。
 - C API 使用 TruFor 固定张量名，不适用于任意 ONNX 模型。

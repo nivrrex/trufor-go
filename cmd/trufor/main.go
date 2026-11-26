@@ -124,6 +124,9 @@ func run(input, output, weightsPath string, threads int, saveNP, force bool) err
 		return err
 	}
 	defer model.Close()
+	if saveNP && !model.NoiseprintSupported() {
+		return fmt.Errorf("当前 ONNX 后端不输出 Noiseprint++，不能使用 -save_np；请改用 trufor.pth.tar 纯 Go 后端")
+	}
 
 	for _, path := range list {
 		outPath := outputPath(input, output, path)

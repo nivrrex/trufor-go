@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/nivrrex/trufor-go/internal/imageio"
@@ -188,8 +189,8 @@ func maxAbsDiff(got, want []float32) (float64, int) {
 	return maxDiff, at
 }
 
-// TestDecoderParity 单独对拍解码头的 1/4 分辨率输出，便于把端到端误差定位到
-// "主干已对齐 / 解码与后处理有偏差" 的分界。
+// TestDecoderParity 使用 PNG 输入单独对拍解码头的 1/4 分辨率输出，便于把端到端误差定位到
+// "主干已对齐 / 解码与后处理有偏差" 的分界。JPEG 的输入解码差异由 E2E 的 JPEG 容差覆盖。
 func TestDecoderParity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("-short 模式跳过")
@@ -210,6 +211,10 @@ func TestDecoderParity(t *testing.T) {
 		imgPath := g.EndToEndImagePath(e.Name)
 		if _, err := os.Stat(imgPath); err != nil {
 			t.Skipf("缺少测试图像 %s", imgPath)
+		}
+		if !strings.EqualFold(filepath.Ext(imgPath), ".png") {
+			t.Logf("%s: 非 PNG 输入存在解码器差异，跳过 decoder 独立对拍（由 E2E JPEG 容差覆盖）", e.Name)
+			continue
 		}
 		w, err := weights.Open(ckpt)
 		if err != nil {
@@ -246,7 +251,9 @@ func TestDecoderParity(t *testing.T) {
 		diff, at := maxAbsDiff(res.Logits.Data, up)
 		t.Logf("%s: loc4 上采后与 Go logits 最大差 %.3e（loc4 参考均值 %.4f，conf4 均值 %.4f）",
 			e.Name, diff, meanOf(refLoc4), meanOf(refConf4))
-		_ = at
+		if diff > 5e-4 {
+			t.Fatalf("%s: decoder loc4 上采后最大差 %.3e 超过 5e-4（第 %d 个元素）", e.Name, diff, at)
+		}
 	}
 }
 

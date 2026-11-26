@@ -1,0 +1,27 @@
+{
+  "python": "3.11.2",
+  "onnxruntime": "1.23.2",
+  "cpu_model": "AMD Ryzen 5 2600 Six-Core Processor",
+  "num_cpu": 12,
+  "threads": 12,
+  "width": 1536,
+  "height": 2048,
+  "warmup": 1,
+  "maxrss_mib": 14867.78125,
+  "samples": [
+    {
+      "run": 1,
+      "seconds": 45.697885221103206,
+      "score": 0.062207049754618673,
+      "map_checksum": 11274515378099886323,
+      "conf_checksum": 11335999943319116109
+    },
+    {
+      "run": 2,
+      "seconds": 43.79018410597928,
+      "score": 0.062207049754618673,
+      "map_checksum": 11274515378099886323,
+      "conf_checksum": 11335999943319116109
+    }
+  ]
+}
