@@ -166,8 +166,8 @@ TRUFOR_ORT_LIBRARY=/path/to/libonnxruntime.so.1 \
 
 | 输入 | 纯 Go（本轮优化后） | Go + ORT | Python ONNX Runtime |
 |---|---:|---:|---:|
-| 1200×900 | 约 23.0 s | 15.0–16.4 s | 16.0–17.1 s |
-| 1536×2048 | 约 80 s | 约 50.1 s | 约 52.8 s |
+| 1200×900 | 约 24.0 s | 约 14.1 s | 约 14.1 s |
+| 1536×2048 | 约 80 s | 约 46.0 s | 约 47.8 s |
 
 ORT 与 Python 的 map/conf 最大绝对差分别约 `1.73e-6` / `5.36e-7`，score 差约 `1.95e-7`。
 原生 3000×4000 输入下，纯 Go 约 540 s、峰值约 15.5GB；Python ORT 申请约 34.9GB
