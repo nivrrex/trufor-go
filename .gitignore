@@ -9,3 +9,10 @@
 __pycache__/
 *.pyc
 /trufor
+
+# 开发上下文与内部记录（不进入公开仓库）
+/AGENTS.md
+/.pi-cg-enabled
+/docs/
+/OPTIMIZATION.md
+/CHANGELOG.md

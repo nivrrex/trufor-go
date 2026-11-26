@@ -1,6 +1,6 @@
 # 同机推理基准
 
-本目录记录 **同一台 AMD Ryzen 5 2600（6C12T）/31GB** 上的可复现结果。Go 1.27.4，
+本目录记录 **同一台 AMD Ryzen 5 2600（6C12T）/31GB** 上的可复现结果。Go 1.27.3，
 12 线程，固定合成输入，模型加载不计时。基线为 `c0f1284`，优化版为当前分支。
 
 ## 复现命令
@@ -37,6 +37,7 @@ python3 tools/bench_python.py --weights /path/to/trufor.onnx \
 | 3000×4000 | 1141.97s | **332.13s** | 未测 | 未测 |
 
 - 纯 Go 使用 `trufor.pth.tar`，ORT 使用 `trufor.onnx`；两者 score/checksum 不要求相同。
-- Go ORT 与 Python ORT 的 score 最大差约 `1.1e-7`；checksum 差异来自 Go 后处理使用
-  float64、NumPy 后处理使用 float32。
+- Go ORT 使用 ONNX Runtime 1.29.0，Python ORT 使用 1.23.2，二者不是同版本运行时。
+  score 最大差约 `1.1e-7` 仅作为跨版本参考；checksum 差异同时来自运行时版本与后处理精度差异，
+  不能据此宣称逐位一致。
 - 原始逐次耗时、score、checksum、分配量和堆占用见同目录 JSON。
