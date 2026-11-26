@@ -45,9 +45,13 @@ func Sgemm(m, n, k int, a []float32, lda int, b []float32, ldb int, c []float32,
 	SgemmGather(m, n, k, a, lda, fill, c, ldc, workers)
 }
 
-// PackA 把 A 打包成微面板并返回 (ap, nTiles, tailRows)，供权重固定的调用方缓存复用。
+// PackA 把 A 打包成微面板并返回 (ap, nTiles, tailRows)，供权重固定的调用方
+// 缓存复用。返回独立新建缓冲（非池化）——调用方可长期持有。
 func PackA(a []float32, m, k, lda int) (ap []float32, nTiles, tailRows int) {
-	return packA(a, m, k, lda)
+	nTiles = m / mr
+	tailRows = m - nTiles*mr
+	ap = make([]float32, nTiles*mr*k+tailRows*k)
+	return packAInto(ap, a, m, k, lda)
 }
 
 // SgemmDirectPrepacked 与 SgemmDirect 相同，但 A 已由 PackA 预先打包（权重固定时省掉每次打包）。
@@ -135,7 +139,9 @@ func SgemmDirect(m, n, k int, a []float32, lda int, b []float32, ldb int, c []fl
 		gemmRowsGo(a, m, k, lda, b, n, ldb, c, ldc, workers)
 		return
 	}
-	ap, nTiles, tailRows := packA(a, m, k, lda)
+	apBuf := getAp(m * k)
+	ap, nTiles, tailRows := packAInto(apBuf, a, m, k, lda)
+	defer putAp(ap)
 	if nTiles == 0 && tailRows < 2 {
 		gemmRowsGo(a, m, k, lda, b, n, ldb, c, ldc, workers)
 		return
@@ -226,12 +232,33 @@ func SgemmDirect(m, n, k int, a []float32, lda int, b []float32, ldb int, c []fl
 	wg.Wait()
 }
 
-// packA 把 A 打包成微面板：6 行一组按 k 交织（ap[t*6*k + p*6 + r]），
-// M 方向不足 6 行的尾块单独打包为 tailRows 行交织。
-func packA(a []float32, m, k, lda int) (ap []float32, nTiles, tailRows int) {
+// apPool 复用 packA 的微面板缓冲（m*k float32/次，推理期最大单类分配 33%）。
+// 池内缓冲按需扩容、只增不减；sync.Pool 由 GC 自动清理。
+// 归还约束：Put 前调用方必须完成对该缓冲的全部读取（含 worker goroutine）。
+var apPool = sync.Pool{New: func() any { return new([]float32) }}
+
+func getAp(n int) []float32 {
+	if v := apPool.Get(); v != nil {
+		if buf := *(v.(*[]float32)); cap(buf) >= n {
+			return buf[:n]
+		}
+	}
+	return make([]float32, n)
+}
+
+func putAp(ap []float32) {
+	if ap != nil {
+		apPool.Put(&ap)
+	}
+}
+
+// packAInto 把 A 打包进调用方提供的缓冲（长度须 ≥ m*k，结果恒为 m*k 元素）：
+// 6 行一组按 k 交织，M 方向不足 6 行的尾块单独打包为 tailRows 行交织。
+// 打包内容与新建缓冲逐位相同，仅生命周期改为池化。
+func packAInto(dst []float32, a []float32, m, k, lda int) (ap []float32, nTiles, tailRows int) {
 	nTiles = m / mr
 	tailRows = m - nTiles*mr
-	ap = make([]float32, nTiles*mr*k+tailRows*k)
+	ap = dst[:nTiles*mr*k+tailRows*k]
 	for t := 0; t < nTiles; t++ {
 		base := t * mr * k
 		for r := 0; r < mr; r++ {
@@ -275,7 +302,11 @@ func SgemmGather(m, n, k int, a []float32, lda int, fill BPanelFiller, c []float
 
 	// 打包 A 微面板：按 6 行一组、k 交织，ap[t*6*k + p*6 + r] = A[(6t+r)*lda + p]。
 	// 每组 6 行对应一次微内核调用；不足 6 行的尾部由标量路径处理。
-	ap, nTiles, tailRows := packA(a, m, k, lda)
+	// 池化缓冲：全部读取（含 worker goroutine）都在 wg.Wait/同步调用结束后
+	// 才返回，defer 归还安全。
+	apBuf := getAp(m * k)
+	ap, nTiles, tailRows := packAInto(apBuf, a, m, k, lda)
+	defer putAp(ap)
 	if nTiles == 0 && tailRows < 1 {
 		col := make([]float32, k*n)
 		fill(0, k, 0, n, col)
