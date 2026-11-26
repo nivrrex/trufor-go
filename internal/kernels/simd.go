@@ -162,6 +162,30 @@ func GELUInPlace(v []float32) {
 	}
 }
 
+// AxpyChannelwiseRange 只累加 token-major 数据的通道区间 [chLo,chHi)。
+// 每个像素的区间按 8 车道 SIMD 累加；用于深度卷积的通道并行。
+func AxpyChannelwiseRange(dst, src, w []float32, channels, chLo, chHi int) {
+	if channels <= 0 || chLo < 0 || chHi <= chLo || chHi > channels || len(w) < channels {
+		return
+	}
+	n := len(dst)
+	if len(src) < n {
+		n = len(src)
+	}
+	n -= n % channels
+	if !simdAvailable() || (chHi-chLo)%8 != 0 {
+		for off := 0; off < n; off += channels {
+			for c := chLo; c < chHi; c++ {
+				dst[off+c] += src[off+c] * w[c]
+			}
+		}
+		return
+	}
+	for off := 0; off < n; off += channels {
+		axpyVec(&dst[off+chLo], &src[off+chLo], &w[chLo], chHi-chLo)
+	}
+}
+
 // AxpyChannelwise 计算 dst[t*C + c] += src[t*C + c] * w[c]，即 token-major 数据上
 // 按通道加权的累加（深度卷积在 token-major 布局下的核心运算）。
 // n 为 dst/src 的元素数，C = len(w)。

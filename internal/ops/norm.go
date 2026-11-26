@@ -128,8 +128,9 @@ func mergeHeads(headsData []float32, n, heads, d int) []float32 {
 	return out
 }
 
-// attnChunk 是注意力分数的分块行数，限制单块 scores 缓冲在数 MB 级别。
-const attnChunk = 4096
+// attnChunk 是注意力分数的分块行数。小块增加可并行任务数，并降低 scores 内存；
+// 本模型实测 64 行在 Zen2 上最优。
+const attnChunk = 64
 
 // attentionScorePool 复用每个 query 块 worker 的 scores 缓冲。缓冲所有权只在该
 // worker 内，函数返回前不得再读取；sync.Pool 由 GC 自动清理。

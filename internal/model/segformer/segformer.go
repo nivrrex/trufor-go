@@ -12,6 +12,7 @@ package segformer
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/nivrrex/trufor-go/internal/ops"
 	"github.com/nivrrex/trufor-go/internal/tensor"
@@ -233,25 +234,60 @@ func (b *Backbone) forward(rgb, np *tensor.Tensor, trace TraceFunc) ([]*tensor.T
 				return nil, err
 			}
 		}
-		for j, blk := range b.rgbBlk[i] {
-			rgbTok, err = blk.forward(rgbTok, h, w, b.workers)
-			if err != nil {
-				return nil, fmt.Errorf("stage%d block%d: %w", i+1, j, err)
-			}
-			if trace != nil {
-				if err := b.traceTokens(trace, fmt.Sprintf("stage%d.block%d", i+1, j), rgbTok, embedDims[i], h, w); err != nil {
+		runBranch := func(blocks []*block, tok []float32, branchWorkers int) ([]float32, error) {
+			var err error
+			for _, blk := range blocks {
+				tok, err = blk.forward(tok, h, w, branchWorkers)
+				if err != nil {
 					return nil, err
 				}
 			}
+			return tok, nil
 		}
-		for j, blk := range b.npBlk[i] {
-			npTok, err = blk.forward(npTok, h, w, b.workers)
-			if err != nil {
-				return nil, fmt.Errorf("stage%d extra_block%d: %w", i+1, j, err)
+		if trace == nil && b.workers > 1 && len(b.rgbBlk[i]) > 0 && len(b.npBlk[i]) > 0 {
+			branchWorkers := b.workers / 2
+			if branchWorkers < 1 {
+				branchWorkers = 1
 			}
-			if trace != nil {
-				if err := b.traceTokens(trace, fmt.Sprintf("stage%d.extra_block%d", i+1, j), npTok, embedDims[i], h, w); err != nil {
-					return nil, err
+			var wg sync.WaitGroup
+			var rgbErr, npErr error
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				rgbTok, rgbErr = runBranch(b.rgbBlk[i], rgbTok, branchWorkers)
+			}()
+			go func() {
+				defer wg.Done()
+				npTok, npErr = runBranch(b.npBlk[i], npTok, branchWorkers)
+			}()
+			wg.Wait()
+			if rgbErr != nil {
+				return nil, fmt.Errorf("stage%d RGB block: %w", i+1, rgbErr)
+			}
+			if npErr != nil {
+				return nil, fmt.Errorf("stage%d extra block: %w", i+1, npErr)
+			}
+		} else {
+			for j, blk := range b.rgbBlk[i] {
+				rgbTok, err = blk.forward(rgbTok, h, w, b.workers)
+				if err != nil {
+					return nil, fmt.Errorf("stage%d block%d: %w", i+1, j, err)
+				}
+				if trace != nil {
+					if err := b.traceTokens(trace, fmt.Sprintf("stage%d.block%d", i+1, j), rgbTok, embedDims[i], h, w); err != nil {
+						return nil, err
+					}
+				}
+			}
+			for j, blk := range b.npBlk[i] {
+				npTok, err = blk.forward(npTok, h, w, b.workers)
+				if err != nil {
+					return nil, fmt.Errorf("stage%d extra_block%d: %w", i+1, j, err)
+				}
+				if trace != nil {
+					if err := b.traceTokens(trace, fmt.Sprintf("stage%d.extra_block%d", i+1, j), npTok, embedDims[i], h, w); err != nil {
+						return nil, err
+					}
 				}
 			}
 		}
@@ -331,6 +367,34 @@ func (p *patchEmbed) forward(x *tensor.Tensor, workers int) ([]float32, int, int
 
 // ---- transformer block ----
 
+type blockScratch struct {
+	n, dim, hidden   int
+	normed1, normed2 []float32
+	hid, dw, mlpOut  []float32
+}
+
+// blockScratchPool 复用 transformer block 的中间缓冲。每个调用独占一个实例，
+// defer Put 前所有 worker 必须已结束；sync.Pool 由 GC 自动清理。
+var blockScratchPool sync.Pool
+
+func getBlockScratch(n, dim, hidden int) *blockScratch {
+	var s *blockScratch
+	if v := blockScratchPool.Get(); v != nil {
+		s = v.(*blockScratch)
+	} else {
+		s = &blockScratch{}
+	}
+	if s.n != n || s.dim != dim || s.hidden != hidden {
+		s.n, s.dim, s.hidden = n, dim, hidden
+		s.normed1 = make([]float32, n*dim)
+		s.normed2 = make([]float32, n*dim)
+		s.hid = make([]float32, n*hidden)
+		s.dw = make([]float32, n*hidden)
+		s.mlpOut = make([]float32, n*dim)
+	}
+	return s
+}
+
 type block struct {
 	norm1 *ops.LayerNorm
 	norm2 *ops.LayerNorm
@@ -341,8 +405,11 @@ type block struct {
 func (b *block) forward(tok []float32, h, w, workers int) ([]float32, error) {
 	n := h * w
 	c := b.attn.dim()
+	scratch := getBlockScratch(n, c, b.mlp.hidden)
+	defer blockScratchPool.Put(scratch)
 
-	normed := append([]float32(nil), tok...)
+	normed := scratch.normed1
+	copy(normed, tok)
 	if err := b.norm1.ApplyTokensParallel(normed, n, workers); err != nil {
 		return nil, err
 	}
@@ -355,16 +422,16 @@ func (b *block) forward(tok []float32, h, w, workers int) ([]float32, error) {
 		res[i] = tok[i] + att[i]
 	}
 
-	normed2 := append([]float32(nil), res...)
+	normed2 := scratch.normed2
+	copy(normed2, res)
 	if err := b.norm2.ApplyTokensParallel(normed2, n, workers); err != nil {
 		return nil, err
 	}
-	mlpOut, err := b.mlp.forward(normed2, c, n, h, w, workers)
-	if err != nil {
+	if err := b.mlp.forwardInto(normed2, c, n, h, w, workers, scratch.hid, scratch.dw, scratch.mlpOut); err != nil {
 		return nil, err
 	}
 	for i := range res {
-		res[i] += mlpOut[i]
+		res[i] += scratch.mlpOut[i]
 	}
 	return res, nil
 }
@@ -435,21 +502,25 @@ type mixFFN struct {
 
 func (m *mixFFN) forward(tok []float32, dim, n, h, w, workers int) ([]float32, error) {
 	hid := make([]float32, n*m.hidden)
-	if err := m.fc1.Forward(tok, n, hid, workers); err != nil {
-		return nil, err
-	}
-	// 深度卷积直接在 token-major 布局上做（9 次按通道加权的位移累加），
-	// 省掉"token ↔ NCHW"两次整块转置；累加顺序仍为 (ky,kx) 递增，结果与 NCHW 版本一致。
-	dw, err := m.dw.ForwardTokens(hid, n, h, w)
-	if err != nil {
-		return nil, fmt.Errorf("mlp.dwconv: %w", err)
-	}
-	ops.GELUInPlaceParallel(dw, workers)
+	dw := make([]float32, n*m.hidden)
 	out := make([]float32, n*dim)
-	if err := m.fc2.Forward(dw, n, out, workers); err != nil {
+	if err := m.forwardInto(tok, dim, n, h, w, workers, hid, dw, out); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+func (m *mixFFN) forwardInto(tok []float32, dim, n, h, w, workers int, hid, dw, out []float32) error {
+	if err := m.fc1.Forward(tok, n, hid, workers); err != nil {
+		return err
+	}
+	// 深度卷积直接在 token-major 布局上做（9 次按通道加权的位移累加），
+	// 省掉"token ↔ NCHW"两次整块转置；累加顺序仍为 (ky,kx) 递增，结果与 NCHW 版本一致。
+	if err := m.dw.ForwardTokensParallelInto(hid, n, h, w, workers, dw); err != nil {
+		return fmt.Errorf("mlp.dwconv: %w", err)
+	}
+	ops.GELUInPlaceParallel(dw, workers)
+	return m.fc2.Forward(dw, n, out, workers)
 }
 
 func sameShape(a, b []int) bool {

@@ -540,22 +540,75 @@ func (c *Conv2D) convRowsFused(x, out *tensor.Tensor, rowLo, rowHi, workers int,
 // 累加顺序为 (ky,kx) 递增，与 NCHW 版本逐位相同。
 // 仅支持 groups==InC==OutC 的 3×3、stride=1、padding=1 情形，其余情形返回错误。
 func (c *Conv2D) ForwardTokens(tok []float32, n, h, w int) ([]float32, error) {
+	return c.ForwardTokensParallel(tok, n, h, w, 1)
+}
+
+// ForwardTokensParallel 与 ForwardTokens 相同，但按通道块并行；每个像素的 tap 累加顺序不变。
+func (c *Conv2D) ForwardTokensParallel(tok []float32, n, h, w, workers int) ([]float32, error) {
+	dst := make([]float32, n*c.InC)
+	if err := c.ForwardTokensParallelInto(tok, n, h, w, workers, dst); err != nil {
+		return nil, err
+	}
+	return dst, nil
+}
+
+// ForwardTokensParallelInto 将深度卷积结果写入 dst；长度须至少为 n*InC。
+// dst 会被完整覆盖，可安全复用。
+func (c *Conv2D) ForwardTokensParallelInto(tok []float32, n, h, w, workers int, dst []float32) error {
 	if c.Groups != c.InC || c.OutC != c.InC || c.KH != 3 || c.KW != 3 || c.Stride != 1 || c.PadH != 1 || c.PadW != 1 {
-		return nil, fmt.Errorf("conv2d.ForwardTokens: 仅支持 3×3/stride1/pad1 的深度卷积")
+		return fmt.Errorf("conv2d.ForwardTokens: 仅支持 3×3/stride1/pad1 的深度卷积")
 	}
 	if h*w != n {
-		return nil, fmt.Errorf("conv2d.ForwardTokens: n=%d 与 %dx%d 不符", n, h, w)
+		return fmt.Errorf("conv2d.ForwardTokens: n=%d 与 %dx%d 不符", n, h, w)
 	}
 	if len(tok) < n*c.InC {
-		return nil, fmt.Errorf("conv2d.ForwardTokens: 数据长度不足")
+		return fmt.Errorf("conv2d.ForwardTokens: 数据长度不足")
 	}
 	ch := c.InC
-	dst := make([]float32, n*ch)
+	if len(dst) < n*ch {
+		return fmt.Errorf("conv2d.ForwardTokensParallelInto: 目标缓冲长度不足")
+	}
+	dst = dst[:n*ch]
+	weights := make([][]float32, 9)
+	for tap := range weights {
+		weights[tap] = c.tapWeights(tap/3, tap%3)
+	}
+	if workers <= 1 || ch < 16 || n*ch < 1<<20 {
+		c.forwardTokensChannels(tok, dst, h, w, 0, ch, weights)
+		return nil
+	}
+	if workers > ch/8 {
+		workers = ch / 8
+	}
+	step := ((ch+workers-1)/workers + 7) &^ 7
+	var wg sync.WaitGroup
+	for lo := 0; lo < ch; lo += step {
+		hi := lo + step
+		if hi > ch {
+			hi = ch
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			c.forwardTokensChannels(tok, dst, h, w, lo, hi, weights)
+		}(lo, hi)
+	}
+	wg.Wait()
+	return nil
+}
+
+func (c *Conv2D) forwardTokensChannels(tok, dst []float32, h, w, chLo, chHi int, weights [][]float32) {
+	ch := c.InC
 	if c.bias != nil {
-		for i := 0; i < n; i++ {
-			base := i * ch
-			for cc := 0; cc < ch; cc++ {
-				dst[base+cc] = c.bias[cc]
+		for i := 0; i < h*w; i++ {
+			for cc := chLo; cc < chHi; cc++ {
+				dst[i*ch+cc] = c.bias[cc]
+			}
+		}
+	} else {
+		for i := 0; i < h*w; i++ {
+			for cc := chLo; cc < chHi; cc++ {
+				dst[i*ch+cc] = 0
 			}
 		}
 	}
@@ -566,7 +619,6 @@ func (c *Conv2D) ForwardTokens(tok []float32, n, h, w int) ([]float32, error) {
 				if uint(iy) >= uint(h) {
 					continue
 				}
-				// 列方向的有效区间：ox + kx - 1 ∈ [0, w)
 				lo := 0
 				if kx == 0 {
 					lo = 1
@@ -580,11 +632,10 @@ func (c *Conv2D) ForwardTokens(tok []float32, n, h, w int) ([]float32, error) {
 				}
 				srcOff := (iy*w + lo + kx - 1) * ch
 				dstOff := (oy*w + lo) * ch
-				kernels.AxpyChannelwise(dst[dstOff:dstOff+(hi-lo)*ch], tok[srcOff:srcOff+(hi-lo)*ch], c.tapWeights(ky, kx))
+				kernels.AxpyChannelwiseRange(dst[dstOff:dstOff+(hi-lo)*ch], tok[srcOff:srcOff+(hi-lo)*ch], weights[ky*3+kx], ch, chLo, chHi)
 			}
 		}
 	}
-	return dst, nil
 }
 
 // tapWeights 返回深度卷积在某 (ky,kx) 位移上的逐通道权重（长度为通道数）。

@@ -166,7 +166,12 @@ func (m *Model) forward(rgb01 *tensor.Tensor, trace TraceFunc) (*Result, error) 
 	var stack [4]*tensor.Tensor
 	copy(stack[:], feats)
 
-	locLogits4, confLogits4, err := decoder.ForwardPair(m.locHead, m.confHead, stack)
+	var locLogits4, confLogits4 *tensor.Tensor
+	if m.workers > 1 {
+		locLogits4, confLogits4, err = decoder.ForwardPairParallel(m.locHead, m.confHead, stack, m.workers)
+	} else {
+		locLogits4, confLogits4, err = decoder.ForwardPair(m.locHead, m.confHead, stack)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("decoder: %w", err)
 	}

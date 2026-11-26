@@ -397,6 +397,40 @@ func TestConvTapsPath(t *testing.T) {
 // TestDepthwiseTokens 校验 token-major 深度卷积与 NCHW 版本一致。
 // 两者累加顺序相同，但边界列在 NCHW 版本走标量（mul+add）、在 token 版本走 SIMD（FMA），
 // 因此差异在 fp32 舍入噪声量级（< 1e-5 相对）。
+func TestDepthwiseTokensParallelDeterministic(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+	const channels, h, w = 64, 64, 64
+	tok := make([]float32, channels*h*w)
+	weights := make([]float32, channels*9)
+	bias := make([]float32, channels)
+	for i := range tok {
+		tok[i] = float32(rng.NormFloat64())
+	}
+	for i := range weights {
+		weights[i] = float32(rng.NormFloat64()) * 0.2
+	}
+	for i := range bias {
+		bias[i] = float32(rng.NormFloat64()) * 0.1
+	}
+	conv, err := NewConv2DGrouped(weights, channels, channels, 3, 3, 1, 1, 1, channels, bias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := conv.ForwardTokens(tok, h*w, h, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := conv.ForwardTokensParallel(tok, h*w, h, w, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range want {
+		if math.Float32bits(want[i]) != math.Float32bits(got[i]) {
+			t.Fatalf("元素 %d: got %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
 func TestDepthwiseTokens(t *testing.T) {
 	rng := rand.New(rand.NewSource(32))
 	const inC, h, w = 16, 9, 7

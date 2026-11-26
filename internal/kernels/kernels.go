@@ -18,10 +18,11 @@ import "sync"
 const (
 	mr = 6
 	nr = 16
-	// kc 为 K 方向分块长度：既限制 B 面板大小，也让 A 面板留在缓存内。
-	kc = 256
+	// kc 为 K 方向分块长度：Direct 路径每块只装卸一次 C；1024 在 Zen2 上
+	// 减少输出访存，同时打包面板（1024×32 float32）仍可留在单核 L2。
+	kc = 1024
 	// nc 为 N 方向分块长度。
-	nc = 64
+	nc = 16
 	// mc 为 M 方向分块长度（6 的整数倍）。
 	mc = 96
 )
@@ -139,9 +140,19 @@ func SgemmDirect(m, n, k int, a []float32, lda int, b []float32, ldb int, c []fl
 		gemmRowsGo(a, m, k, lda, b, n, ldb, c, ldc, workers)
 		return
 	}
-	apBuf := getAp(m * k)
-	ap, nTiles, tailRows := packAInto(apBuf, a, m, k, lda)
-	defer putAp(ap)
+	nTiles := m / mr
+	tailRows := m - nTiles*mr
+	var tailAP []float32
+	if tailRows > 0 {
+		tailAP = getAp(tailRows * k)
+		for r := 0; r < tailRows; r++ {
+			row := a[(nTiles*mr+r)*lda:]
+			for p := 0; p < k; p++ {
+				tailAP[p*tailRows+r] = row[p]
+			}
+		}
+		defer putAp(tailAP)
+	}
 	if nTiles == 0 && tailRows < 2 {
 		gemmRowsGo(a, m, k, lda, b, n, ldb, c, ldc, workers)
 		return
@@ -172,18 +183,18 @@ func SgemmDirect(m, n, k int, a []float32, lda int, b []float32, ldb int, c []fl
 				}
 				bp := &b[k0*ldb+jt]
 				for t := 0; t < nTiles; t++ {
-					micro6x16s(&ap[t*mr*k+k0*mr], bp, &c[t*mr*ldc+jt], kk, ldc, ldb)
+					micro6x16sRows(&a[t*mr*lda+k0], bp, &c[t*mr*ldc+jt], kk, lda, ldc, ldb)
 				}
 				if tailRows > 0 {
-					tailBase := nTiles*mr*k + k0*tailRows
+					tailBase := k0 * tailRows
 					tailC := &c[nTiles*mr*ldc+jt]
 					switch tailRows {
 					case 4:
-						micro4x16s(&ap[tailBase], bp, tailC, kk, ldc, ldb)
+						micro4x16s(&tailAP[tailBase], bp, tailC, kk, ldc, ldb)
 					case 2:
-						micro2x16s(&ap[tailBase], bp, tailC, kk, ldc, ldb)
+						micro2x16s(&tailAP[tailBase], bp, tailC, kk, ldc, ldb)
 					case 1:
-						micro1x16s(&ap[tailBase], bp, tailC, kk, ldc, ldb)
+						micro1x16s(&tailAP[tailBase], bp, tailC, kk, ldc, ldb)
 					default:
 						for i := nTiles * mr; i < m; i++ {
 							panel := make([]float32, kk*nr)
@@ -324,19 +335,15 @@ func SgemmGather(m, n, k int, a []float32, lda int, fill BPanelFiller, c []float
 	}
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
-		lo := w * jBlocks / workers
-		hi := (w + 1) * jBlocks / workers
+		lo := w * jBlocks / workers * nc
+		hi := (w + 1) * jBlocks / workers * nc
+		if hi > n {
+			hi = n
+		}
 		wg.Add(1)
 		go func(lo, hi int) {
 			defer wg.Done()
-			for jb := lo; jb < hi; jb++ {
-				j0 := jb * nc
-				j1 := j0 + nc
-				if j1 > n {
-					j1 = n
-				}
-				workerRange(ap, a, fill, c, m, n, k, lda, ldc, j0, j1, nTiles, tailRows)
-			}
+			workerRange(ap, a, fill, c, m, n, k, lda, ldc, lo, hi, nTiles, tailRows)
 		}(lo, hi)
 	}
 	wg.Wait()
@@ -344,7 +351,7 @@ func SgemmGather(m, n, k int, a []float32, lda int, fill BPanelFiller, c []float
 
 // panelWidth 是 B 打包的列宽：一次打包 32 列（两个 16 列微内核共用），
 // 相比 16 列可把打包拷贝的调用次数减半，同时让微内核连续访问同一段面板。
-const panelWidth = nr * 4
+const panelWidth = nr * 2
 
 // workerRange 处理列区间 [j0, j1)。ap 为交织后的 A 微面板，a 为原始 A（标量尾块用）。
 func workerRange(ap, a []float32, fill BPanelFiller, c []float32, m, n, k, lda, ldc, j0, j1, nTiles, tailRows int) {

@@ -14,6 +14,9 @@ func micro6x16(ap, bp, c *float32, kc, ldc int)
 // micro6x16s 与 micro6x16 相同，但 B 的行跨度由 bstride 给出（用于跳过 B 打包）。
 func micro6x16s(ap, bp, c *float32, kc, ldc, bstride int)
 
+// micro6x16sRows 直接读取 row-major A，避免交错打包。
+func micro6x16sRows(a, bp, c *float32, kc, lda, ldc, bstride int)
+
 // micro4x16 / micro2x16 用于 M 方向的尾块（OutC % 6 ∈ {4, 2} 时），
 // 避免尾块落到标量路径上成为瓶颈。
 func micro4x16(ap, bp, c *float32, kc, ldc int)

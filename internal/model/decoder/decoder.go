@@ -8,6 +8,7 @@ package decoder
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/nivrrex/trufor-go/internal/ops"
 	"github.com/nivrrex/trufor-go/internal/tensor"
@@ -66,6 +67,40 @@ func ForwardPair(loc, conf *Head, feats [4]*tensor.Tensor) (*tensor.Tensor, *ten
 	confOut, err := conf.forward(feats, ws)
 	if err != nil {
 		return nil, nil, err
+	}
+	return locOut, confOut, nil
+}
+
+// ForwardPairParallel 并行执行定位头与置信头，各自使用独立工作区。
+func ForwardPairParallel(loc, conf *Head, feats [4]*tensor.Tensor, workers int) (*tensor.Tensor, *tensor.Tensor, error) {
+	if loc == nil || conf == nil || loc.embedDim != conf.embedDim {
+		return nil, nil, fmt.Errorf("decoder: 定位头/置信头配置不匹配")
+	}
+	h, w := feats[0].H, feats[0].W
+	locWS := getDecoderWorkspace(h, w, loc.embedDim, feats)
+	confWS := getDecoderWorkspace(h, w, conf.embedDim, feats)
+	branchWorkers := workers / 2
+	if branchWorkers < 1 {
+		branchWorkers = 1
+	}
+	var wg sync.WaitGroup
+	var locOut, confOut *tensor.Tensor
+	var locErr, confErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		locOut, locErr = loc.forwardWithWorkers(feats, locWS, branchWorkers)
+	}()
+	go func() {
+		defer wg.Done()
+		confOut, confErr = conf.forwardWithWorkers(feats, confWS, branchWorkers)
+	}()
+	wg.Wait()
+	if locErr != nil {
+		return nil, nil, locErr
+	}
+	if confErr != nil {
+		return nil, nil, confErr
 	}
 	return locOut, confOut, nil
 }
@@ -164,6 +199,10 @@ func (h *Head) Forward(feats [4]*tensor.Tensor) (*tensor.Tensor, error) {
 }
 
 func (h *Head) forward(feats [4]*tensor.Tensor, ws *decoderWorkspace) (*tensor.Tensor, error) {
+	return h.forwardWithWorkers(feats, ws, h.workers)
+}
+
+func (h *Head) forwardWithWorkers(feats [4]*tensor.Tensor, ws *decoderWorkspace, workers int) (*tensor.Tensor, error) {
 	h0, w0 := feats[0].H, feats[0].W
 	for i, f := range feats {
 		if f == nil {
@@ -173,14 +212,14 @@ func (h *Head) forward(feats [4]*tensor.Tensor, ws *decoderWorkspace) (*tensor.T
 			return nil, fmt.Errorf("decoder: 第 %d 级通道 %d != %d", i, f.C, h.lin[i].In)
 		}
 	}
-	h.fuse.InitOutput(ws.fused, h.workers)
+	h.fuse.InitOutput(ws.fused, workers)
 	// 上游拼接顺序是 [_c4,_c3,_c2,_c1]；逆序处理以保持融合卷积 K 方向的
 	// 累加顺序，同时只复用一块上采缓冲并避免 4×embedDim 的 merged 张量。
 	for i := 3; i >= 0; i-- {
 		f := feats[i]
 		n := f.H * f.W
 		buf := ws.tok[:n*h.embedDim]
-		if err := h.lin[i].Forward(f.ToTokens(), n, buf, h.workers); err != nil {
+		if err := h.lin[i].Forward(f.ToTokens(), n, buf, workers); err != nil {
 			return nil, err
 		}
 		tensor.FromTokensInto(buf, h.embedDim, f.H, f.W, ws.proj[i])
@@ -188,13 +227,13 @@ func (h *Head) forward(feats [4]*tensor.Tensor, ws *decoderWorkspace) (*tensor.T
 		if i == 0 {
 			projected = ws.proj[i]
 		} else {
-			if err := ops.ResizeBilinearIntoParallel(ws.proj[i], h0, w0, ws.up, h.workers); err != nil {
+			if err := ops.ResizeBilinearIntoParallel(ws.proj[i], h0, w0, ws.up, workers); err != nil {
 				return nil, err
 			}
 			projected = ws.up
 		}
 		block := 3 - i
-		if err := h.fuse.Accumulate1x1IntoPacked(ws.fused, projected, block*h.embedDim, h.fuseAP[block], h.fuseTile[block], h.fuseTail[block], h.workers); err != nil {
+		if err := h.fuse.Accumulate1x1IntoPacked(ws.fused, projected, block*h.embedDim, h.fuseAP[block], h.fuseTile[block], h.fuseTail[block], workers); err != nil {
 			return nil, err
 		}
 	}
@@ -203,5 +242,5 @@ func (h *Head) forward(feats [4]*tensor.Tensor, ws *decoderWorkspace) (*tensor.T
 		return nil, err
 	}
 	ops.ReLUInPlace(ws.fused)
-	return h.pred.Forward(ws.fused, h.workers)
+	return h.pred.Forward(ws.fused, workers)
 }

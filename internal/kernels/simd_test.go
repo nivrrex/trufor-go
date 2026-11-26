@@ -57,6 +57,33 @@ func TestMaxSumLanes(t *testing.T) {
 	}
 }
 
+func TestAxpyChannelwiseRangeMatchesFull(t *testing.T) {
+	if !simdAvailable() {
+		t.Skip("无 AVX2，跳过")
+	}
+	rng := rand.New(rand.NewSource(41))
+	const channels, pixels = 64, 37
+	src := make([]float32, channels*pixels)
+	weights := make([]float32, channels)
+	for i := range src {
+		src[i] = float32(rng.NormFloat64())
+	}
+	for i := range weights {
+		weights[i] = float32(rng.NormFloat64())
+	}
+	want := make([]float32, len(src))
+	got := make([]float32, len(src))
+	AxpyChannelwise(want, src, weights)
+	for lo := 0; lo < channels; lo += 8 {
+		AxpyChannelwiseRange(got, src, weights, channels, lo, lo+8)
+	}
+	for i := range want {
+		if math.Float32bits(want[i]) != math.Float32bits(got[i]) {
+			t.Fatalf("元素 %d: got %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
 func BenchmarkExpCompare(b *testing.B) {
 	v := make([]float32, 4096)
 	for i := range v {

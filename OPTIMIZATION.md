@@ -1,4 +1,4 @@
-# TruFor Go 性能优化记录（2026-11-25）
+# TruFor Go 性能优化记录（2026-11-25 至 2026-11-26）
 
 基线：`c0f1284`。目标：在保持黄金测试与端到端对拍通过的前提下，缩小 Go/Python CPU 推理差距。
 
@@ -34,7 +34,35 @@
 - 3MP：约 80s。
 - 12MP：约 540s，峰值约 15.5GB（上一轮约 1296s/16.5GB）。
 
-## 2. 可选 ONNX Runtime CPU 后端
+## 2. 第二轮纯 Go 优化（2026-11-26）
+
+### GEMM 访存与分块
+
+- Direct GEMM 新增 row-major A 微内核，完整 6 行块不再做 `packAInto`；仅尾行打包。
+- `kc=1024`、`nc=16`、`panelWidth=32`；`SgemmGather` 每个 worker 一次处理连续列区间，
+  避免按 16 列块重复分配 B 面板。
+
+### 调度与内存
+
+- 深度卷积 token 路径按通道块并行，使用 AVX2 区间累加；每像素 tap 顺序不变。
+- transformer block 池化 LayerNorm/FFN 中间缓冲。
+- 每个 stage 的 RGB/Noiseprint 两支并行，各分一半 worker；trace 路径保持串行。
+- 定位头/置信头并行，各自使用独立工作区与一半 worker。
+- `attnChunk=64`，增加注意力可并行任务数并降低 scores 内存。
+
+### 结果
+
+- 1MP：约 24.0s → **14.24–14.31s**，与 Python ORT 约 14.11s 基本一致。
+- 3MP：约 80s → **约 53–55s**，Python ORT 约 47.8s。
+- 12MP：约 540s → **约 339.9s**，峰值约 16.8GB。
+- 1MP/3MP score 与本轮开始时一致；6 图端到端对拍结构性差异 0。
+
+### 第二轮回退项
+
+Linear 全切 B 打包、B 面板预打包、3×32 TapPlan、Direct 3×32、注意力/FFM scratch 扩展、
+卷积块预算/segment 调优、后处理并行均无稳定收益或显著增加内存，已回退。
+
+## 3. 可选 ONNX Runtime CPU 后端
 
 构建标签：`trufor_ort`，仅 `cgo && linux && amd64` 启用；其它平台编译为明确错误占位。
 默认 `CGO_ENABLED=0` 构建不引入 CGO 或运行时依赖。
@@ -56,7 +84,7 @@
 
 原生 3000×4000 下 Python ORT 申请约 34.9GB 缓冲并失败；Go ORT 未在该尺寸宣称通过。
 
-## 3. 已证伪/回退
+## 4. 已证伪/回退
 
 - kernel 内 M 方向并行：wall +7~10%，goroutine 启动与带宽争抢。
 - softmax 行并行：wall +7%，高频小调用开销。
@@ -68,16 +96,17 @@
 - 6×16 微内核 K 展开 2 次：约 22.2s vs 21.0s，回退。
 - CrossAttention M 并行：1MP 变慢，回退。
 
-## 4. 验证
+## 5. 验证
 
 - `go test -count=1 ./...`：默认纯 Go 全通过。
+- 纯 Go 并发包 `CGO_ENABLED=1 go test -race`（kernels/ops/segformer/trufor）：通过。
 - `CGO_ENABLED=1 go test -race -tags trufor_ort ./internal/ort`：通过。
 - ORT 集成测试覆盖正常输出、并发 Run 确定性、Close 后错误、缺失模型错误。
 - C shim：`-Wall -Wextra -Wconversion -Wshadow -Werror` 通过；ASan+UBSan 最小推理通过。
 - seal-go 默认与 ORT 构建、Windows 默认交叉编译通过。
 - 6 图端到端对拍：纯 Go 与 ORT 两条链路均 `compare.py` 退出 0（结构性差异 0）。
 
-## 5. 已知限制
+## 6. 已知限制
 
 - ORT 后端仅 linux/amd64；Windows 仍使用默认纯 Go 构建。
 - ORT 库与 ONNX 权重不随仓库分发；需用户提供。
