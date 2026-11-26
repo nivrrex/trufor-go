@@ -364,57 +364,34 @@ func workerRange(ap, a []float32, fill BPanelFiller, c []float32, m, n, k, lda, 
 			// 现场生成 B 面板（卷积在此完成带 padding 的取值）
 			panel := bp[:kk*cols]
 			fill(k0, kk, jt, cols, panel)
-			if cols == nr {
-				// 16 列尾面板：仍走微内核，保证与 32 列面板路径逐位一致（同为 FMA 累加）
+			fullCols := cols &^ (nr - 1)
+			for sub := 0; sub < fullCols; sub += nr {
 				for t := 0; t < nTiles; t++ {
-					micro6x16s(&ap[t*mr*k+k0*mr], &panel[0], &c[t*mr*ldc+jt], kk, ldc, cols)
+					micro6x16s(&ap[t*mr*k+k0*mr], &panel[sub], &c[t*mr*ldc+jt+sub], kk, ldc, cols)
 				}
 				if tailRows > 0 {
 					tailBase := nTiles*mr*k + k0*tailRows
+					tailC := &c[nTiles*mr*ldc+jt+sub]
 					switch tailRows {
 					case 4:
-						micro4x16s(&ap[tailBase], &panel[0], &c[nTiles*mr*ldc+jt], kk, ldc, cols)
+						micro4x16s(&ap[tailBase], &panel[sub], tailC, kk, ldc, cols)
 					case 2:
-						micro2x16s(&ap[tailBase], &panel[0], &c[nTiles*mr*ldc+jt], kk, ldc, cols)
+						micro2x16s(&ap[tailBase], &panel[sub], tailC, kk, ldc, cols)
 					case 1:
-						micro1x16s(&ap[tailBase], &panel[0], &c[nTiles*mr*ldc+jt], kk, ldc, cols)
-					default:
-						for i := nTiles * mr; i < m; i++ {
-							scalarRowGen(a, panel, c, i, jt, cols, k0, kk, lda, ldc)
-						}
+						micro1x16s(&ap[tailBase], &panel[sub], tailC, kk, ldc, cols)
 					}
 				}
-				continue
 			}
-			if cols == panelWidth {
-				for sub := 0; sub < cols; sub += nr {
-					for t := 0; t < nTiles; t++ {
-						micro6x16s(&ap[t*mr*k+k0*mr], &panel[sub], &c[t*mr*ldc+jt+sub], kk, ldc, cols)
-					}
-					if tailRows > 0 {
-						tailBase := nTiles*mr*k + k0*tailRows
-						tailC := &c[nTiles*mr*ldc+jt+sub]
-						switch tailRows {
-						case 4:
-							micro4x16s(&ap[tailBase], &panel[sub], tailC, kk, ldc, cols)
-						case 2:
-							micro2x16s(&ap[tailBase], &panel[sub], tailC, kk, ldc, cols)
-						case 1:
-							micro1x16s(&ap[tailBase], &panel[sub], tailC, kk, ldc, cols)
-						}
-					}
+			// 3/5 行没有对应微内核，只让这些尾行走标量；完整 16 列块不再整段退化。
+			if tailRows == 3 || tailRows == 5 {
+				for i := nTiles * mr; i < m; i++ {
+					scalarRowGenStride(a, panel, c, i, jt, fullCols, cols, 0, k0, kk, lda, ldc)
 				}
-				// 3/5 行的尾块走标量（每层只有一次，不能放进上面的子块循环）
-				if tailRows == 3 || tailRows == 5 {
-					for i := nTiles * mr; i < m; i++ {
-						scalarRowGen(a, panel, c, i, jt, cols, k0, kk, lda, ldc)
-					}
-				}
-				continue
 			}
-			// 列方向不足 32 的尾块：标量处理
-			for i := 0; i < m; i++ {
-				scalarRowGen(a, panel, c, i, jt, cols, k0, kk, lda, ldc)
+			if tailCols := cols - fullCols; tailCols > 0 {
+				for i := 0; i < m; i++ {
+					scalarRowGenStride(a, panel, c, i, jt+fullCols, tailCols, cols, fullCols, k0, kk, lda, ldc)
+				}
 			}
 		}
 	}
@@ -422,11 +399,16 @@ func workerRange(ap, a []float32, fill BPanelFiller, c []float32, m, n, k, lda, 
 
 // scalarRowGen 是标量尾块路径：C[i, jt:jt+cols] += Σ_p A[i,p]·panel[p][jj]。
 func scalarRowGen(a, panel, c []float32, i, jt, cols, k0, kk, lda, ldc int) {
+	scalarRowGenStride(a, panel, c, i, jt, cols, cols, 0, k0, kk, lda, ldc)
+}
+
+// scalarRowGenStride 与 scalarRowGen 相同，但 panel 的行跨度和起始列可以独立指定。
+func scalarRowGenStride(a, panel, c []float32, i, jt, cols, panelStride, panelCol, k0, kk, lda, ldc int) {
 	aRow := a[i*lda+k0 : i*lda+k0+kk]
 	for jj := 0; jj < cols; jj++ {
 		var acc float32
 		for p := 0; p < kk; p++ {
-			acc += aRow[p] * panel[p*cols+jj]
+			acc += aRow[p] * panel[p*panelStride+panelCol+jj]
 		}
 		c[i*ldc+jt+jj] += acc
 	}

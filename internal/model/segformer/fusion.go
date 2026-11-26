@@ -343,10 +343,10 @@ func (f *ffm) forward(x1, x2 *tensor.Tensor, workers int) (*tensor.Tensor, error
 		cross1[i] = tok1[i] + o1[i]
 		cross2[i] = tok2[i] + o2[i]
 	}
-	if err := f.norm1.ApplyTokens(cross1, n); err != nil {
+	if err := f.norm1.ApplyTokensParallel(cross1, n, workers); err != nil {
 		return nil, err
 	}
-	if err := f.norm2.ApplyTokens(cross2, n); err != nil {
+	if err := f.norm2.ApplyTokensParallel(cross2, n, workers); err != nil {
 		return nil, err
 	}
 

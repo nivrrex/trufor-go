@@ -158,7 +158,7 @@ func (c *Conv2D) forwardInto(x, dst *tensor.Tensor, epi *Affine, workers int) er
 	// Winograd F(2×2,3×3)：3×3/stride1/pad1 且尺寸够大时换用变换域计算
 	if c.useWinograd(x.H, x.W) {
 		c.convWinograd(x, dst, workers)
-		c.finishEpi(dst, epi)
+		c.finishEpi(dst, epi, workers)
 		return nil
 	}
 	blockRows := c.blockRowsFor(ow)
@@ -166,16 +166,12 @@ func (c *Conv2D) forwardInto(x, dst *tensor.Tensor, epi *Affine, workers int) er
 	// 输出初值直接填成 bias（无 bias 则清零）：所有卷积路径都在这块缓冲上累加，
 	// 因此卷积结束后不必再单独遍历一遍加 bias。
 	if c.bias != nil {
-		plane := oh * ow
-		for o := 0; o < c.OutC; o++ {
-			seg := dst.Data[o*plane : (o+1)*plane]
-			b := c.bias[o]
-			for i := range seg {
-				seg[i] = b
-			}
-		}
+		c.InitOutput(dst, workers)
 	} else {
-		zeroF32(dst.Data)
+		forEachChannel(dst.C, workers, dst.C*oh*ow, func(o int) {
+			plane := oh * ow
+			zeroF32(dst.Data[o*plane : (o+1)*plane])
+		})
 	}
 
 	// 1×1 / stride 1 / 无 padding：取值即恒等映射，直接把输入通道平面当作 GEMM 的 B。
@@ -183,7 +179,7 @@ func (c *Conv2D) forwardInto(x, dst *tensor.Tensor, epi *Affine, workers int) er
 		planeIn := x.H * x.W
 		ap, tiles, tail := c.packedA()
 		kernels.SgemmPrepacked(ap, c.w, c.OutC, tiles, tail, planeIn, c.InC, x.Data, planeIn, dst.Data, planeIn, workers)
-		c.finishEpi(dst, epi)
+		c.finishEpi(dst, epi, workers)
 		return nil
 	}
 
@@ -203,7 +199,7 @@ func (c *Conv2D) forwardInto(x, dst *tensor.Tensor, epi *Affine, workers int) er
 			}
 			run(x, dst, lo, hi, workers, buf)
 		}
-		c.finishEpi(dst, epi)
+		c.finishEpi(dst, epi, workers)
 		return nil
 	}
 
@@ -246,17 +242,80 @@ func (c *Conv2D) forwardInto(x, dst *tensor.Tensor, epi *Affine, workers int) er
 		}(lo, hi, buf)
 	}
 	wg.Wait()
-	c.finishEpi(dst, epi)
+	c.finishEpi(dst, epi, workers)
+	return nil
+}
+
+// forEachChannel 并行遍历输出通道；小张量保持串行，避免 goroutine 开销。
+func forEachChannel(channels, workers, work int, fn func(o int)) {
+	if workers <= 1 || channels < 2 || work < 1<<18 {
+		for o := 0; o < channels; o++ {
+			fn(o)
+		}
+		return
+	}
+	var wg sync.WaitGroup
+	step := (channels + workers - 1) / workers
+	for lo := 0; lo < channels; lo += step {
+		hi := lo + step
+		if hi > channels {
+			hi = channels
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for o := lo; o < hi; o++ {
+				fn(o)
+			}
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
+// InitOutput 用 bias（无 bias 时为零）初始化卷积输出缓冲。
+func (c *Conv2D) InitOutput(out *tensor.Tensor, workers int) {
+	plane := out.H * out.W
+	forEachChannel(out.C, workers, out.C*plane, func(o int) {
+		seg := out.Data[o*plane : (o+1)*plane]
+		var b float32
+		if c.bias != nil {
+			b = c.bias[o]
+		}
+		for i := range seg {
+			seg[i] = b
+		}
+	})
+}
+
+// PackWeightRange 预打包 1×1 卷积权重中的连续输入通道区间，供固定权重复用。
+func (c *Conv2D) PackWeightRange(offset, k int) ([]float32, int, int, error) {
+	if c.KH != 1 || c.KW != 1 || c.Stride != 1 || c.PadH != 0 || c.PadW != 0 || c.Groups > 1 {
+		return nil, 0, 0, fmt.Errorf("conv2d.PackWeightRange: 仅支持普通 1×1 卷积")
+	}
+	if offset < 0 || k <= 0 || offset+k > c.InC {
+		return nil, 0, 0, fmt.Errorf("conv2d.PackWeightRange: 通道区间非法")
+	}
+	ap, tiles, tail := kernels.PackA(c.w[offset:], c.OutC, k, c.InC)
+	return ap, tiles, tail, nil
+}
+
+// Accumulate1x1IntoPacked 使用 PackWeightRange 生成的权重面板累加 1×1 卷积结果。
+func (c *Conv2D) Accumulate1x1IntoPacked(dst, src *tensor.Tensor, offset int, ap []float32, tiles, tail, workers int) error {
+	if dst.C != c.OutC || src.C <= 0 || offset < 0 || offset+src.C > c.InC || dst.H != src.H || dst.W != src.W {
+		return fmt.Errorf("conv2d.Accumulate1x1IntoPacked: 形状或通道区间不匹配")
+	}
+	plane := src.H * src.W
+	kernels.SgemmPrepacked(ap, c.w[offset:], c.OutC, tiles, tail, plane, src.C, src.Data, plane, dst.Data, plane, workers)
 	return nil
 }
 
 // finishEpi 对卷积输出做逐通道仿射（+ReLU）。bias 已在累加前填入终点值，这里不再加。
-func (c *Conv2D) finishEpi(out *tensor.Tensor, epi *Affine) {
+func (c *Conv2D) finishEpi(out *tensor.Tensor, epi *Affine, workers int) {
 	if epi == nil {
 		return
 	}
 	plane := out.H * out.W
-	for o := 0; o < c.OutC; o++ {
+	forEachChannel(out.C, workers, out.C*plane, func(o int) {
 		seg := out.Data[o*plane : (o+1)*plane]
 		s := epi.Scale[o]
 		t := epi.Shift[o]
@@ -268,12 +327,12 @@ func (c *Conv2D) finishEpi(out *tensor.Tensor, epi *Affine) {
 				}
 				seg[i] = v
 			}
-			continue
+			return
 		}
 		for i, v := range seg {
 			seg[i] = v*s + t
 		}
-	}
+	})
 }
 
 // finish 在卷积输出上一次性完成 bias、仿射与 ReLU。

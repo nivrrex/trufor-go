@@ -44,12 +44,14 @@ func (l *Linear) Forward(src []float32, n int, dst []float32, workers int) error
 	}
 	Gemm(src[:n*l.In], n, l.In, l.wt, l.Out, out, workers)
 	if l.bias != nil {
-		for i := 0; i < n; i++ {
-			row := out[i*l.Out : (i+1)*l.Out]
-			for o := 0; o < l.Out; o++ {
-				row[o] += l.bias[o]
+		parallelFor(n, workers, 1<<15, func(lo, hi int) {
+			for i := lo; i < hi; i++ {
+				row := out[i*l.Out : (i+1)*l.Out]
+				for o := 0; o < l.Out; o++ {
+					row[o] += l.bias[o]
+				}
 			}
-		}
+		})
 	}
 	return nil
 }

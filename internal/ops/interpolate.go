@@ -13,10 +13,42 @@ func ResizeBilinear(x *tensor.Tensor, outH, outW int) (*tensor.Tensor, error) {
 	if outH <= 0 || outW <= 0 {
 		return nil, fmt.Errorf("resize: 目标尺寸非法 %dx%d", outH, outW)
 	}
-	if outH == x.H && outW == x.W {
-		return x.Clone(), nil
+	out := tensor.New(x.C, outH, outW)
+	if err := ResizeBilinearInto(x, outH, outW, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ResizeBilinearParallel 与 ResizeBilinear 相同，但按通道并行。
+func ResizeBilinearParallel(x *tensor.Tensor, outH, outW int, workers int) (*tensor.Tensor, error) {
+	if outH <= 0 || outW <= 0 {
+		return nil, fmt.Errorf("resize: 目标尺寸非法 %dx%d", outH, outW)
 	}
 	out := tensor.New(x.C, outH, outW)
+	if err := ResizeBilinearIntoParallel(x, outH, outW, out, workers); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ResizeBilinearInto 将双线性上采结果写入已有张量，避免重复分配。
+func ResizeBilinearInto(x *tensor.Tensor, outH, outW int, out *tensor.Tensor) error {
+	return ResizeBilinearIntoParallel(x, outH, outW, out, 1)
+}
+
+// ResizeBilinearIntoParallel 与 ResizeBilinearInto 相同，但按通道并行。
+func ResizeBilinearIntoParallel(x *tensor.Tensor, outH, outW int, out *tensor.Tensor, workers int) error {
+	if outH <= 0 || outW <= 0 {
+		return fmt.Errorf("resize: 目标尺寸非法 %dx%d", outH, outW)
+	}
+	if out.C != x.C || out.H != outH || out.W != outW {
+		return fmt.Errorf("resize: 目标形状 (%d,%d,%d) 不匹配", out.C, out.H, out.W)
+	}
+	if outH == x.H && outW == x.W {
+		copy(out.Data, x.Data)
+		return nil
+	}
 	inPlane := x.H * x.W
 	outPlane := outH * outW
 	scaleH := float64(x.H) / float64(outH)
@@ -66,23 +98,25 @@ func ResizeBilinear(x *tensor.Tensor, outH, outW int) (*tensor.Tensor, error) {
 		x0[ox], x1[ox], wx[ox] = i0, i1, src-float64(i0)
 	}
 
-	for c := 0; c < x.C; c++ {
-		srcPlane := x.Data[c*inPlane : (c+1)*inPlane]
-		dstPlane := out.Data[c*outPlane : (c+1)*outPlane]
-		for oy := 0; oy < outH; oy++ {
-			rowA := srcPlane[y0[oy]*x.W : (y0[oy]+1)*x.W]
-			rowB := srcPlane[y1[oy]*x.W : (y1[oy]+1)*x.W]
-			dy := wy[oy]
-			dstRow := dstPlane[oy*outW : (oy+1)*outW]
-			for ox := 0; ox < outW; ox++ {
-				dx := wx[ox]
-				top := float64(rowA[x0[ox]])*(1-dx) + float64(rowA[x1[ox]])*dx
-				bottom := float64(rowB[x0[ox]])*(1-dx) + float64(rowB[x1[ox]])*dx
-				dstRow[ox] = float32(top*(1-dy) + bottom*dy)
+	parallelFor(x.C, workers, 2, func(cLo, cHi int) {
+		for c := cLo; c < cHi; c++ {
+			srcPlane := x.Data[c*inPlane : (c+1)*inPlane]
+			dstPlane := out.Data[c*outPlane : (c+1)*outPlane]
+			for oy := 0; oy < outH; oy++ {
+				rowA := srcPlane[y0[oy]*x.W : (y0[oy]+1)*x.W]
+				rowB := srcPlane[y1[oy]*x.W : (y1[oy]+1)*x.W]
+				dy := wy[oy]
+				dstRow := dstPlane[oy*outW : (oy+1)*outW]
+				for ox := 0; ox < outW; ox++ {
+					dx := wx[ox]
+					top := float64(rowA[x0[ox]])*(1-dx) + float64(rowA[x1[ox]])*dx
+					bottom := float64(rowB[x0[ox]])*(1-dx) + float64(rowB[x1[ox]])*dx
+					dstRow[ox] = float32(top*(1-dy) + bottom*dy)
+				}
 			}
 		}
-	}
-	return out, nil
+	})
+	return nil
 }
 
 // LogSigmoid 返回 log(sigmoid(x)) = -softplus(-x)，逐元素写入 dst。

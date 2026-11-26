@@ -23,6 +23,51 @@ type Head struct {
 	bn       *ops.BatchNorm
 	pred     *ops.Conv2D
 	workers  int
+	fuseAP   [4][]float32
+	fuseTile [4]int
+	fuseTail [4]int
+}
+
+// decoderWorkspace 保存定位头/置信头可复用的中间缓冲。两个头串行执行，
+// ForwardPair 在一次推理内共享同一组内存，返回后由调用方释放。
+type decoderWorkspace struct {
+	tok   []float32
+	proj  [4]*tensor.Tensor
+	up    *tensor.Tensor
+	fused *tensor.Tensor
+}
+
+func getDecoderWorkspace(h, w, embedDim int, feats [4]*tensor.Tensor) *decoderWorkspace {
+	ws := &decoderWorkspace{}
+	maxTokens := 0
+	for i, f := range feats {
+		if n := f.H * f.W; n > maxTokens {
+			maxTokens = n
+		}
+		ws.proj[i] = tensor.New(embedDim, f.H, f.W)
+	}
+	ws.up = tensor.New(embedDim, h, w)
+	ws.tok = make([]float32, maxTokens*embedDim)
+	ws.fused = tensor.New(embedDim, h, w)
+	return ws
+}
+
+// ForwardPair 串行执行定位头与置信头，并共享中间工作区。
+func ForwardPair(loc, conf *Head, feats [4]*tensor.Tensor) (*tensor.Tensor, *tensor.Tensor, error) {
+	if loc == nil || conf == nil || loc.embedDim != conf.embedDim {
+		return nil, nil, fmt.Errorf("decoder: 定位头/置信头配置不匹配")
+	}
+	h, w := feats[0].H, feats[0].W
+	ws := getDecoderWorkspace(h, w, loc.embedDim, feats)
+	locOut, err := loc.forward(feats, ws)
+	if err != nil {
+		return nil, nil, err
+	}
+	confOut, err := conf.forward(feats, ws)
+	if err != nil {
+		return nil, nil, err
+	}
+	return locOut, confOut, nil
 }
 
 // New 从权重构造解码头。prefix 形如 "decode_head" 或 "decode_head_conf"。
@@ -67,6 +112,13 @@ func New(w *weights.File, prefix string, inChannels [4]int, numClass, embedDim i
 	if h.fuse, err = ops.NewConv2D(fw.Data, embedDim, embedDim*4, 1, 1, 1, 0, 0, fb.Data); err != nil {
 		return nil, err
 	}
+	for block := 0; block < 4; block++ {
+		ap, tiles, tail, err := h.fuse.PackWeightRange(block*embedDim, embedDim)
+		if err != nil {
+			return nil, err
+		}
+		h.fuseAP[block], h.fuseTile[block], h.fuseTail[block] = ap, tiles, tail
+	}
 	mean, err := get("linear_fuse.1.running_mean")
 	if err != nil {
 		return nil, err
@@ -106,7 +158,12 @@ func New(w *weights.File, prefix string, inChannels [4]int, numClass, embedDim i
 // Forward 计算 1/4 分辨率的 logits（numClass×h/4×w/4）。
 // feats 为 4 级主干特征，feats[0] 为 1/4 分辨率。
 func (h *Head) Forward(feats [4]*tensor.Tensor) (*tensor.Tensor, error) {
-	var proj [4]*tensor.Tensor
+	h0, w0 := feats[0].H, feats[0].W
+	ws := getDecoderWorkspace(h0, w0, h.embedDim, feats)
+	return h.forward(feats, ws)
+}
+
+func (h *Head) forward(feats [4]*tensor.Tensor, ws *decoderWorkspace) (*tensor.Tensor, error) {
 	h0, w0 := feats[0].H, feats[0].W
 	for i, f := range feats {
 		if f == nil {
@@ -115,40 +172,36 @@ func (h *Head) Forward(feats [4]*tensor.Tensor) (*tensor.Tensor, error) {
 		if f.C != h.lin[i].In {
 			return nil, fmt.Errorf("decoder: 第 %d 级通道 %d != %d", i, f.C, h.lin[i].In)
 		}
+	}
+	h.fuse.InitOutput(ws.fused, h.workers)
+	// 上游拼接顺序是 [_c4,_c3,_c2,_c1]；逆序处理以保持融合卷积 K 方向的
+	// 累加顺序，同时只复用一块上采缓冲并避免 4×embedDim 的 merged 张量。
+	for i := 3; i >= 0; i-- {
+		f := feats[i]
 		n := f.H * f.W
-		buf := make([]float32, n*h.embedDim)
+		buf := ws.tok[:n*h.embedDim]
 		if err := h.lin[i].Forward(f.ToTokens(), n, buf, h.workers); err != nil {
 			return nil, err
 		}
-		proj[i] = tensor.FromTokens(buf, h.embedDim, f.H, f.W)
-		if i > 0 {
-			up, err := ops.ResizeBilinear(proj[i], h0, w0)
-			if err != nil {
+		tensor.FromTokensInto(buf, h.embedDim, f.H, f.W, ws.proj[i])
+		var projected *tensor.Tensor
+		if i == 0 {
+			projected = ws.proj[i]
+		} else {
+			if err := ops.ResizeBilinearIntoParallel(ws.proj[i], h0, w0, ws.up, h.workers); err != nil {
 				return nil, err
 			}
-			proj[i] = up
+			projected = ws.up
+		}
+		block := 3 - i
+		if err := h.fuse.Accumulate1x1IntoPacked(ws.fused, projected, block*h.embedDim, h.fuseAP[block], h.fuseTile[block], h.fuseTail[block], h.workers); err != nil {
+			return nil, err
 		}
 	}
 
-	// 通道拼接顺序与上游 torch.cat([_c4, _c3, _c2, _c1]) 一致：高分辨率特征排在最后
-	merged := tensor.New(h.embedDim*4, h0, w0)
-	plane := h0 * w0
-	for i := 0; i < 4; i++ {
-		block := 3 - i
-		copy(merged.Data[block*h.embedDim*plane:(block+1)*h.embedDim*plane], proj[i].Data)
-	}
-
-	fused, err := h.fuse.ForwardGrouped(merged, h.workers)
-	if err != nil {
+	if err := h.bn.Apply(ws.fused); err != nil {
 		return nil, err
 	}
-	if err := h.bn.Apply(fused); err != nil {
-		return nil, err
-	}
-	ops.ReLUInPlace(fused)
-	logits, err := h.pred.ForwardGrouped(fused, h.workers)
-	if err != nil {
-		return nil, err
-	}
-	return logits, nil
+	ops.ReLUInPlace(ws.fused)
+	return h.pred.Forward(ws.fused, h.workers)
 }

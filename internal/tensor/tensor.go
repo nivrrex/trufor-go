@@ -110,6 +110,19 @@ func FromTokens(tok []float32, c, h, w int) *Tensor {
 		panic(fmt.Sprintf("tensor.FromTokens: 长度 %d != %d", len(tok), n*c))
 	}
 	out := New(c, h, w)
+	FromTokensInto(tok, c, h, w, out)
+	return out
+}
+
+// FromTokensInto 将 token-major 数据转置写入已有 NCHW 张量，避免重复分配。
+func FromTokensInto(tok []float32, c, h, w int, out *Tensor) {
+	n := h * w
+	if len(tok) != n*c {
+		panic(fmt.Sprintf("tensor.FromTokens: 长度 %d != %d", len(tok), n*c))
+	}
+	if out.C != c || out.H != h || out.W != w || len(out.Data) != n*c {
+		panic(fmt.Sprintf("tensor.FromTokensInto: 目标形状或长度不匹配"))
+	}
 	for i0 := 0; i0 < n; i0 += transBlock {
 		iEnd := i0 + transBlock
 		if iEnd > n {
@@ -128,5 +141,4 @@ func FromTokens(tok []float32, c, h, w int) *Tensor {
 			}
 		}
 	}
-	return out
 }

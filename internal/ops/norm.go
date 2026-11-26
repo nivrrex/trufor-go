@@ -3,6 +3,7 @@ package ops
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/nivrrex/trufor-go/internal/kernels"
 	"github.com/nivrrex/trufor-go/internal/tensor"
@@ -61,6 +62,13 @@ func (l *LayerNorm) Apply(x *tensor.Tensor) error {
 // 0.5*x*(1+erf(x/sqrt(2)))。有 AVX2 时走 SIMD 版 erf（A&S 7.1.26，误差 < 1.5e-7）。
 func GELUInPlace(x *tensor.Tensor) {
 	kernels.GELUInPlace(x.Data)
+}
+
+// GELUInPlaceParallel 与 GELUInPlace 相同，但大切片按连续区间并行。
+func GELUInPlaceParallel(data []float32, workers int) {
+	parallelFor(len(data), workers, 1<<20, func(lo, hi int) {
+		kernels.GELUInPlace(data[lo:hi])
+	})
 }
 
 // SigmoidInPlace 就地执行 1/(1+exp(-x))。
@@ -123,6 +131,26 @@ func mergeHeads(headsData []float32, n, heads, d int) []float32 {
 // attnChunk 是注意力分数的分块行数，限制单块 scores 缓冲在数 MB 级别。
 const attnChunk = 4096
 
+// attentionScorePool 复用每个 query 块 worker 的 scores 缓冲。缓冲所有权只在该
+// worker 内，函数返回前不得再读取；sync.Pool 由 GC 自动清理。
+var attentionScorePool sync.Pool
+
+func getAttentionScores(n int) []float32 {
+	if v := attentionScorePool.Get(); v != nil {
+		if buf := *(v.(*[]float32)); cap(buf) >= n {
+			return buf[:n]
+		}
+	}
+	return make([]float32, n)
+}
+
+func putAttentionScores(buf []float32) {
+	// 不保留过大的临时缓冲，避免模型常驻时把多阶段大图内存锁住。
+	if cap(buf) <= 128<<20 {
+		attentionScorePool.Put(&buf)
+	}
+}
+
 // MultiHeadSelfAttention 对 n 个 token、dim 通道的多头自注意力：
 // out[n×dim] = concat_h( softmax(q_h k_hᵀ * scale) v_h )，scale = headDim^-0.5。
 // 两次矩阵乘法都走 GEMM 内核（与 PyTorch 的 scaled_dot_product_attention 等价）。
@@ -149,36 +177,90 @@ func MultiHeadSelfAttention(q, k, v, out []float32, n, s, dim, heads, workers in
 		vh = splitHeads(v, s, heads, d)
 		oh = make([]float32, n*dim)
 	}
-	kt := make([]float32, d*s)
-	scores := make([]float32, attnChunk*s)
+	kt := make([]float32, heads*d*s)
 	for h := 0; h < heads; h++ {
-		// k_h (s×d) → kᵀ (d×s)，使 q·kᵀ 可以按行连续地做 GEMM
+		ktHead := kt[h*d*s:]
 		for p := 0; p < s; p++ {
 			base := (h*s + p) * d
 			for c := 0; c < d; c++ {
-				kt[c*s+p] = kh[base+c]
+				ktHead[c*s+p] = kh[base+c]
 			}
 		}
-		for lo := 0; lo < n; lo += attnChunk {
-			hi := lo + attnChunk
-			if hi > n {
-				hi = n
-			}
-			m := hi - lo
-			sc := scores[:m*s]
-			for i := range sc {
-				sc[i] = 0
-			}
-			GemmStrided(qh[(h*n+lo)*d:], m, d, kt, s, sc, s, workers)
-			for i := 0; i < m; i++ {
-				row := sc[i*s : (i+1)*s]
-				for j := range row {
-					row[j] *= scale
+	}
+	chunks := (n + attnChunk - 1) / attnChunk
+	if workers == 1 || chunks*heads == 1 {
+		// 单任务时保留原路径：两次 GEMM 各自利用 workers，避免把可并行的 N 方向退化掉。
+		scores := getAttentionScores(attnChunk * s)
+		defer putAttentionScores(scores)
+		for h := 0; h < heads; h++ {
+			for lo := 0; lo < n; lo += attnChunk {
+				hi := lo + attnChunk
+				if hi > n {
+					hi = n
 				}
-				softmaxInPlace(row)
+				m := hi - lo
+				sc := scores[:m*s]
+				for i := range sc {
+					sc[i] = 0
+				}
+				GemmStrided(qh[(h*n+lo)*d:], m, d, kt[h*d*s:], s, sc, s, workers)
+				for i := 0; i < m; i++ {
+					row := sc[i*s : (i+1)*s]
+					for j := range row {
+						row[j] *= scale
+					}
+					softmaxInPlace(row)
+				}
+				GemmStrided(sc, m, s, vh[h*s*d:], d, oh[(h*n+lo)*d:], d, workers)
 			}
-			GemmStrided(sc, m, s, vh[h*s*d:], d, oh[(h*n+lo)*d:], d, workers)
 		}
+	} else {
+		// query 块之间没有依赖。每个 worker 独占一块 scores，连续完成 QK→softmax→AV，
+		// 只同步一次；这同时避免了 softmax 串行和 AV-GEMM 在 n=d≤64 时退化为串行。
+		// 每块仍按 k 递增累加，浮点运算顺序与串行路径一致。
+		tasks := chunks * heads
+		parallel := min(workers, tasks)
+		const scoreBudget = 256 << 20 // float32 元素；限制新增 scores 缓冲总量约 1 GiB。
+		rowsPerBuffer := min(attnChunk, n)
+		if byMemory := scoreBudget / (rowsPerBuffer * s); byMemory > 0 {
+			parallel = min(parallel, byMemory)
+		}
+		if parallel < 1 {
+			parallel = 1
+		}
+		var wg sync.WaitGroup
+		for w := 0; w < parallel; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				scores := getAttentionScores(rowsPerBuffer * s)
+				defer putAttentionScores(scores)
+				for task := w; task < tasks; task += parallel {
+					h := task / chunks
+					chunk := task - h*chunks
+					lo := chunk * attnChunk
+					hi := lo + attnChunk
+					if hi > n {
+						hi = n
+					}
+					m := hi - lo
+					sc := scores[:m*s]
+					for i := range sc {
+						sc[i] = 0
+					}
+					GemmStrided(qh[(h*n+lo)*d:], m, d, kt[h*d*s:], s, sc, s, 1)
+					for i := 0; i < m; i++ {
+						row := sc[i*s : (i+1)*s]
+						for j := range row {
+							row[j] *= scale
+						}
+						softmaxInPlace(row)
+					}
+					GemmStrided(sc, m, s, vh[h*s*d:], d, oh[(h*n+lo)*d:], d, 1)
+				}
+			}(w)
+		}
+		wg.Wait()
 	}
 	if heads > 1 {
 		copy(out, mergeHeads(oh, n, heads, d))
@@ -261,6 +343,11 @@ func SigmoidSlice(v []float32) {
 
 // ApplyTokens 对 token-major（[n][C]）数据沿通道维归一化，等价于对 NCHW 的逐像素归一化。
 func (l *LayerNorm) ApplyTokens(tok []float32, n int) error {
+	return l.ApplyTokensParallel(tok, n, 1)
+}
+
+// ApplyTokensParallel 与 ApplyTokens 相同，但按 token 并行；每个 token 独立归一化。
+func (l *LayerNorm) ApplyTokensParallel(tok []float32, n, workers int) error {
 	if n <= 0 {
 		return fmt.Errorf("layernorm: token 数非法 %d", n)
 	}
@@ -269,23 +356,25 @@ func (l *LayerNorm) ApplyTokens(tok []float32, n int) error {
 	}
 	c := l.C
 	inv := 1.0 / float64(c)
-	for i := 0; i < n; i++ {
-		row := tok[i*c : (i+1)*c]
-		var sum float64
-		for _, v := range row {
-			sum += float64(v)
+	parallelFor(n, workers, 1<<15, func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			row := tok[i*c : (i+1)*c]
+			var sum float64
+			for _, v := range row {
+				sum += float64(v)
+			}
+			mean := sum * inv
+			var varSum float64
+			for _, v := range row {
+				d := float64(v) - mean
+				varSum += d * d
+			}
+			scale := 1.0 / math.Sqrt(varSum*inv+l.eps)
+			for j := 0; j < c; j++ {
+				v := (float64(row[j]) - mean) * scale
+				row[j] = float32(v*float64(l.gamma[j]) + float64(l.beta[j]))
+			}
 		}
-		mean := sum * inv
-		var varSum float64
-		for _, v := range row {
-			d := float64(v) - mean
-			varSum += d * d
-		}
-		scale := 1.0 / math.Sqrt(varSum*inv+l.eps)
-		for j := 0; j < c; j++ {
-			v := (float64(row[j]) - mean) * scale
-			row[j] = float32(v*float64(l.gamma[j]) + float64(l.beta[j]))
-		}
-	}
+	})
 	return nil
 }

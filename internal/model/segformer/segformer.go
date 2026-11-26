@@ -13,7 +13,6 @@ package segformer
 import (
 	"fmt"
 
-	"github.com/nivrrex/trufor-go/internal/kernels"
 	"github.com/nivrrex/trufor-go/internal/ops"
 	"github.com/nivrrex/trufor-go/internal/tensor"
 	"github.com/nivrrex/trufor-go/internal/weights"
@@ -256,10 +255,10 @@ func (b *Backbone) forward(rgb, np *tensor.Tensor, trace TraceFunc) ([]*tensor.T
 				}
 			}
 		}
-		if err := b.rgbNorm[i].ApplyTokens(rgbTok, h*w); err != nil {
+		if err := b.rgbNorm[i].ApplyTokensParallel(rgbTok, h*w, b.workers); err != nil {
 			return nil, fmt.Errorf("stage%d norm: %w", i+1, err)
 		}
-		if err := b.npNorm[i].ApplyTokens(npTok, h*w); err != nil {
+		if err := b.npNorm[i].ApplyTokensParallel(npTok, h*w, b.workers); err != nil {
 			return nil, fmt.Errorf("stage%d extra_norm: %w", i+1, err)
 		}
 		if trace != nil {
@@ -324,7 +323,7 @@ func (p *patchEmbed) forward(x *tensor.Tensor, workers int) ([]float32, int, int
 		return nil, 0, 0, err
 	}
 	tok := out.ToTokens()
-	if err := p.norm.ApplyTokens(tok, out.H*out.W); err != nil {
+	if err := p.norm.ApplyTokensParallel(tok, out.H*out.W, workers); err != nil {
 		return nil, 0, 0, err
 	}
 	return tok, out.H, out.W, nil
@@ -344,7 +343,7 @@ func (b *block) forward(tok []float32, h, w, workers int) ([]float32, error) {
 	c := b.attn.dim()
 
 	normed := append([]float32(nil), tok...)
-	if err := b.norm1.ApplyTokens(normed, n); err != nil {
+	if err := b.norm1.ApplyTokensParallel(normed, n, workers); err != nil {
 		return nil, err
 	}
 	att, err := b.attn.forward(normed, c, n, h, w, workers)
@@ -357,7 +356,7 @@ func (b *block) forward(tok []float32, h, w, workers int) ([]float32, error) {
 	}
 
 	normed2 := append([]float32(nil), res...)
-	if err := b.norm2.ApplyTokens(normed2, n); err != nil {
+	if err := b.norm2.ApplyTokensParallel(normed2, n, workers); err != nil {
 		return nil, err
 	}
 	mlpOut, err := b.mlp.forward(normed2, c, n, h, w, workers)
@@ -398,7 +397,7 @@ func (a *attention) forward(tok []float32, dim, n, h, w, workers int) ([]float32
 		}
 		src = reduced.ToTokens()
 		s = reduced.H * reduced.W
-		if err := a.srNorm.ApplyTokens(src, s); err != nil {
+		if err := a.srNorm.ApplyTokensParallel(src, s, workers); err != nil {
 			return nil, err
 		}
 	} else {
@@ -445,7 +444,7 @@ func (m *mixFFN) forward(tok []float32, dim, n, h, w, workers int) ([]float32, e
 	if err != nil {
 		return nil, fmt.Errorf("mlp.dwconv: %w", err)
 	}
-	kernels.GELUInPlace(dw)
+	ops.GELUInPlaceParallel(dw, workers)
 	out := make([]float32, n*dim)
 	if err := m.fc2.Forward(dw, n, out, workers); err != nil {
 		return nil, err

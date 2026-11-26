@@ -166,13 +166,9 @@ func (m *Model) forward(rgb01 *tensor.Tensor, trace TraceFunc) (*Result, error) 
 	var stack [4]*tensor.Tensor
 	copy(stack[:], feats)
 
-	locLogits4, err := m.locHead.Forward(stack)
+	locLogits4, confLogits4, err := decoder.ForwardPair(m.locHead, m.confHead, stack)
 	if err != nil {
-		return nil, fmt.Errorf("定位头: %w", err)
-	}
-	confLogits4, err := m.confHead.Forward(stack)
-	if err != nil {
-		return nil, fmt.Errorf("置信头: %w", err)
+		return nil, fmt.Errorf("decoder: %w", err)
 	}
 
 	if trace != nil {
@@ -185,11 +181,11 @@ func (m *Model) forward(rgb01 *tensor.Tensor, trace TraceFunc) (*Result, error) 
 	}
 
 	// 上采到原始分辨率
-	logits, err := ops.ResizeBilinear(locLogits4, rgb01.H, rgb01.W)
+	logits, err := ops.ResizeBilinearParallel(locLogits4, rgb01.H, rgb01.W, m.workers)
 	if err != nil {
 		return nil, err
 	}
-	confLogits, err := ops.ResizeBilinear(confLogits4, rgb01.H, rgb01.W)
+	confLogits, err := ops.ResizeBilinearParallel(confLogits4, rgb01.H, rgb01.W, m.workers)
 	if err != nil {
 		return nil, err
 	}
